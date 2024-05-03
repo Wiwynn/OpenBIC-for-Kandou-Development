@@ -45,8 +45,8 @@ static bool verify_crc8_pec(uint8_t *crc_list, I2C_MSG *msg)
 	crc_reslut = cal_crc8_pec(crc_list, 3 + bytecnt + 1);
 
 	if (pec_crc != crc_reslut) {
-		LOG_ERR("The read data pec_crc=0x%x is invalid, the right crc value=0x%x",
-			pec_crc, crc_reslut);
+		LOG_ERR("The read data pec_crc=0x%x is invalid, the right crc value=0x%x", pec_crc,
+			crc_reslut);
 		return false;
 	}
 	return true;
@@ -148,8 +148,8 @@ bool get_temperature(I2C_MSG *msg, float *temperature)
 		uint8_t bytecnt = msg->data[0];
 		*temperature =
 			((float)(msg->data[bytecnt - 3] + (msg->data[bytecnt - 2] << 8) +
-      (msg->data[bytecnt - 1] << 16) + (msg->data[bytecnt] << 24)) /
-      (float)(1 << FLOAT_PRECISION)) +
+				 (msg->data[bytecnt - 1] << 16) + (msg->data[bytecnt] << 24)) /
+			 (float)(1 << FLOAT_PRECISION)) +
 			ABSOLUTE_ZER0;
 		return true;
 	}
