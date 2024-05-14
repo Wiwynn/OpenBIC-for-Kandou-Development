@@ -33,7 +33,7 @@ static bool verify_crc8_pec(uint8_t *crc_list, I2C_MSG *msg)
 	CHECK_NULL_ARG_WITH_RETURN(crc_list, false);
 	CHECK_NULL_ARG_WITH_RETURN(msg, false);
 
-	uint8_t pec_crc, crc_reslut;
+	uint8_t pec_crc, crc_result;
 	uint8_t bytecnt = msg->data[0];
 	crc_list[0] = KB900X_SLAVE_ADDR << 1;
 	crc_list[1] = I2C_READ_CCODE_END;
@@ -42,11 +42,11 @@ static bool verify_crc8_pec(uint8_t *crc_list, I2C_MSG *msg)
 
 	pec_crc = msg->data[bytecnt + 1]; // pec value
 
-	crc_reslut = cal_crc8_pec(crc_list, 3 + bytecnt + 1);
+	crc_result = cal_crc8_pec(crc_list, 3 + bytecnt + 1);
 
-	if (pec_crc != crc_reslut) {
+	if (pec_crc != crc_result) {
 		LOG_ERR("The read data pec_crc=0x%x is invalid, the right crc value=0x%x", pec_crc,
-			crc_reslut);
+			crc_result);
 		return false;
 	}
 	return true;
@@ -95,11 +95,15 @@ bool smbus_read(I2C_MSG *msg, uint16_t offsets)
 	memset(msg->data, 0, I2C_BUFF_SIZE);
 	msg->tx_len = 1;
 	msg->rx_len = 8;
-	msg->data[0] = I2C_READ_CCODE_END;
-	if (i2c_master_read(msg, MAX_RETRY)) {
-		LOG_ERR("Failed to read PCIE RETIMER addr 0x%X", offsets);
-		goto exit;
-	}
+	retry = -1;
+	do {
+		retry++;
+		msg->data[0] = I2C_READ_CCODE_END;
+		if (i2c_master_read(msg, MAX_RETRY)) {
+			LOG_ERR("Failed to read PCIE RETIMER addr 0x%X", offsets);
+			goto exit;
+		}
+	} while (retry < MAX_RETRY && !verify_crc8_pec(crc_list, msg));
 
 	// PEC validation
 	if (!verify_crc8_pec(crc_list, msg)) {
