@@ -1666,7 +1666,7 @@ uint8_t kb900x_read(sensor_cfg *cfg, int *reading)
 		return SENSOR_UNSPECIFIED_ERROR;
 	}
 
-	kb900x_init_arg *init_args = (kb900x_init_arg *)cfg->init_args;
+	const kb900x_init_arg *init_args = (const kb900x_init_arg *)cfg->init_args;
 	if (!init_args->is_init) {
 		LOG_ERR("KB900x: Device is not initialized");
 		return SENSOR_UNSPECIFIED_ERROR;
