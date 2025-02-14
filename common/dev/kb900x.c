@@ -23,6 +23,30 @@
 LOG_MODULE_REGISTER(dev_kb900x, LOG_LEVEL_DBG);
 K_MUTEX_DEFINE(kb900x_mutex);
 
+#define KB900X_LOCK_MUTEX(mutex, fail_return_type)                                                 \
+	{                                                                                          \
+		uint8_t retry = 0;                                                                 \
+		for (; retry < KB900X_MAX_RETRY; retry++) {                                        \
+			if (k_mutex_lock(&(mutex), K_MSEC(KB900X_MUTEX_LOCK_MS))) {                \
+				k_msleep(10);                                                      \
+			} else {                                                                   \
+				break;                                                             \
+			}                                                                          \
+		}                                                                                  \
+		if (retry == KB900X_MAX_RETRY) {                                                   \
+			LOG_ERR("kb900x mutex lock failed");                                       \
+			return (fail_return_type);                                                 \
+		}                                                                                  \
+	}
+
+#define UNLOCK_MUTEX(mutex, fail_return_type)                                                      \
+	{                                                                                          \
+		if (k_mutex_unlock(&(mutex))) {                                                    \
+			LOG_ERR("kb900x i2c master mutex unlock failed");                          \
+			return (fail_return_type);                                                 \
+		}                                                                                  \
+	}
+
 kb900x_error_t kb900x_write_register(I2C_MSG *msg, uint32_t address, uint32_t value);
 kb900x_error_t kb900x_read_register(I2C_MSG *msg, uint32_t address, uint32_t *value);
 kb900x_error_t kb900x_write_field(I2C_MSG *msg, uint32_t addr, uint8_t field_width,
@@ -72,48 +96,35 @@ kb900x_error_t smbus_read_command(I2C_MSG *msg, uint16_t offsets)
 {
 	CHECK_NULL_ARG_WITH_RETURN(msg, KB900X_E_INVALID_ARG);
 
-	uint8_t retry = 0;
 	kb900x_error_t ret = KB900X_E_OK;
 
-	// Lock mutex
-	for (; retry < KB900X_MAX_RETRY; retry++) {
-		if (k_mutex_lock(&kb900x_mutex, K_MSEC(KB900X_MUTEX_LOCK_MS))) {
-			k_msleep(10);
-		} else {
-			break;
-		}
-	}
-	if (retry == KB900X_MAX_RETRY) {
-		LOG_ERR("kb900x mutex lock failed");
-		return KB900X_E_MUX_LOCK_FAILED;
-	}
-
-	msg->data[0] = KB900X_CCODE_START_READ_FUNC0; // COMMAND CODE
-	msg->data[1] = KB900X_I2C_WRITE_BYTCNT; // byte count
-	msg->data[2] = (uint8_t)(offsets & 0xFF); // lower offset
-	msg->data[3] = (uint8_t)(offsets >> 8); // upper offset
-	msg->tx_len = 5;
-
-	// PEC signature
-	uint8_t crc_list[msg->tx_len];
-	crc_list[0] = msg->target_addr << 1;
-	memcpy(&(crc_list[1]), msg->data, msg->tx_len - 1);
-	msg->data[msg->tx_len - 1] = cal_crc8_pec(crc_list, msg->tx_len);
-
-	// Write (Prepare read)
-	if (i2c_master_write(msg, retry)) {
-		LOG_ERR("Failed to write, 0x%X not set", offsets);
-		ret = KB900X_E_I2C_ERROR;
-		goto exit;
-	}
-
-	// Read
-	memset(msg->data, 0, I2C_BUFF_SIZE);
-	msg->tx_len = 1;
-	msg->rx_len = 8;
-	retry = 0;
+	KB900X_LOCK_MUTEX(kb900x_mutex, KB900X_E_MUX_LOCK_FAILED);
+	uint8_t retry = 0;
 	do {
 		retry++;
+		msg->data[0] = KB900X_CCODE_START_READ_FUNC0; // COMMAND CODE
+		msg->data[1] = KB900X_I2C_WRITE_BYTCNT; // byte count
+		msg->data[2] = (uint8_t)(offsets & 0xFF); // lower offset
+		msg->data[3] = (uint8_t)(offsets >> 8); // upper offset
+		msg->tx_len = 5;
+
+		// PEC signature
+		uint8_t crc_list[msg->tx_len];
+		crc_list[0] = msg->target_addr << 1;
+		memcpy(&(crc_list[1]), msg->data, msg->tx_len - 1);
+		msg->data[msg->tx_len - 1] = cal_crc8_pec(crc_list, msg->tx_len);
+
+		// Write (Prepare read)
+		if (i2c_master_write(msg, KB900X_MAX_RETRY)) {
+			LOG_ERR("Failed to write, 0x%X not set", offsets);
+			ret = KB900X_E_I2C_ERROR;
+			goto exit;
+		}
+
+		// Read
+		memset(msg->data, 0, I2C_BUFF_SIZE);
+		msg->tx_len = 1;
+		msg->rx_len = 8;
 		msg->data[0] = KB900X_CCODE_END_READ_FUNC0;
 		if (i2c_master_read(msg, KB900X_MAX_RETRY)) {
 			LOG_ERR("Failed to read PCIE RETIMER addr 0x%X", offsets);
@@ -129,10 +140,7 @@ kb900x_error_t smbus_read_command(I2C_MSG *msg, uint16_t offsets)
 	}
 
 exit:
-	if (k_mutex_unlock(&kb900x_mutex)) {
-		LOG_ERR("kb900x mutex unlock failed");
-		ret = KB900X_E_MUX_UNLOCK_FAILED;
-	}
+	UNLOCK_MUTEX(kb900x_mutex, KB900X_E_MUX_UNLOCK_FAILED);
 	return ret;
 }
 
@@ -151,21 +159,9 @@ kb900x_error_t twi_read_register(I2C_MSG *msg, uint32_t address, uint32_t *value
 	CHECK_NULL_ARG_WITH_RETURN(value, KB900X_E_INVALID_ARG);
 	CHECK_NULL_ARG_WITH_RETURN(msg, KB900X_E_INVALID_ARG);
 
-	uint8_t retry = 0;
 	kb900x_error_t ret = KB900X_E_OK;
 
-	// Lock mutex
-	for (; retry < KB900X_MAX_RETRY; retry++) {
-		if (k_mutex_lock(&kb900x_mutex, K_MSEC(KB900X_MUTEX_LOCK_MS))) {
-			k_msleep(10);
-		} else {
-			break;
-		}
-	}
-	if (retry == KB900X_MAX_RETRY) {
-		LOG_ERR("kb900x mutex lock failed");
-		return KB900X_E_MUX_LOCK_FAILED;
-	}
+	KB900X_LOCK_MUTEX(kb900x_mutex, KB900X_E_MUX_LOCK_FAILED);
 
 	// As we don't care about the APB and tile number (only accessing tile0)
 	const uint32_t mask = 0x0CFFFFFF;
@@ -178,7 +174,7 @@ kb900x_error_t twi_read_register(I2C_MSG *msg, uint32_t address, uint32_t *value
 	msg->tx_len = KB900X_REGISTER_ADDRESS_WIDTH;
 
 	// Write (Prepare read)
-	if (i2c_master_write(msg, retry)) {
+	if (i2c_master_write(msg, KB900X_MAX_RETRY)) {
 		LOG_ERR("Failed to write, 0x%X not set", address);
 		ret = KB900X_E_I2C_ERROR;
 		goto exit;
@@ -200,10 +196,7 @@ kb900x_error_t twi_read_register(I2C_MSG *msg, uint32_t address, uint32_t *value
 	}
 
 exit:
-	if (k_mutex_unlock(&kb900x_mutex)) {
-		LOG_ERR("kb900x mutex unlock failed");
-		ret = KB900X_E_MUX_UNLOCK_FAILED;
-	}
+	UNLOCK_MUTEX(kb900x_mutex, KB900X_E_MUX_UNLOCK_FAILED);
 	return ret;
 }
 
@@ -221,21 +214,9 @@ kb900x_error_t twi_write_register(I2C_MSG *msg, uint32_t address, uint32_t value
 {
 	CHECK_NULL_ARG_WITH_RETURN(msg, KB900X_E_INVALID_ARG);
 
-	uint8_t retry = 0;
 	kb900x_error_t ret = KB900X_E_OK;
 
-	// Lock mutex
-	for (; retry < KB900X_MAX_RETRY; retry++) {
-		if (k_mutex_lock(&kb900x_mutex, K_MSEC(KB900X_MUTEX_LOCK_MS))) {
-			k_msleep(10);
-		} else {
-			break;
-		}
-	}
-	if (retry == KB900X_MAX_RETRY) {
-		LOG_ERR("kb900x mutex lock failed");
-		return KB900X_E_MUX_LOCK_FAILED;
-	}
+	KB900X_LOCK_MUTEX(kb900x_mutex, KB900X_E_MUX_LOCK_FAILED);
 
 	// As we don't care about the APB and tile number (only accessing tile0)
 	const uint32_t mask = 0x0CFFFFFF;
@@ -252,17 +233,14 @@ kb900x_error_t twi_write_register(I2C_MSG *msg, uint32_t address, uint32_t value
 	msg->tx_len = KB900X_REGISTER_ADDRESS_WIDTH + KB900X_REGISTER_VALUE_WIDTH;
 
 	// Write
-	if (i2c_master_write(msg, retry)) {
+	if (i2c_master_write(msg, KB900X_MAX_RETRY)) {
 		LOG_ERR("Failed to write, 0x%X not set", address);
 		ret = KB900X_E_I2C_ERROR;
 		goto exit;
 	}
 
 exit:
-	if (k_mutex_unlock(&kb900x_mutex)) {
-		LOG_ERR("kb900x mutex unlock failed");
-		ret = KB900X_E_MUX_UNLOCK_FAILED;
-	}
+	UNLOCK_MUTEX(kb900x_mutex, KB900X_E_MUX_UNLOCK_FAILED);
 	return ret;
 }
 
@@ -281,54 +259,42 @@ kb900x_error_t smbus_read_register(I2C_MSG *msg, uint32_t address, uint32_t *val
 	CHECK_NULL_ARG_WITH_RETURN(value, KB900X_E_INVALID_ARG);
 	CHECK_NULL_ARG_WITH_RETURN(msg, KB900X_E_INVALID_ARG);
 
-	uint8_t retry = 0;
 	kb900x_error_t ret = KB900X_E_OK;
 
-	// Lock mutex
-	for (; retry < KB900X_MAX_RETRY; retry++) {
-		if (k_mutex_lock(&kb900x_mutex, K_MSEC(KB900X_MUTEX_LOCK_MS))) {
-			k_msleep(10);
-		} else {
-			break;
-		}
-	}
-	if (retry == KB900X_MAX_RETRY) {
-		LOG_ERR("kb900x mutex lock failed");
-		return KB900X_E_MUX_LOCK_FAILED;
-	}
+	KB900X_LOCK_MUTEX(kb900x_mutex, KB900X_E_MUX_LOCK_FAILED);
 
-	uint8_t payload_offset = 0;
-	// Command code
-	msg->data[payload_offset++] = KB900X_CCODE_START_READ_FUNC2;
-	// Bytecnt
-	msg->data[payload_offset++] = KB900X_REGISTER_ADDRESS_WIDTH;
-	for (int i = 0; i < KB900X_REGISTER_ADDRESS_WIDTH; i++) {
-		msg->data[payload_offset + i] = (address >> (i * 8)) & 0xFF;
-	}
-	payload_offset += KB900X_REGISTER_ADDRESS_WIDTH;
-	msg->tx_len = payload_offset + 1; // + PEC
-
-	// PEC signature
-	uint8_t crc_list[msg->tx_len];
-	crc_list[0] = msg->target_addr << 1;
-	memcpy(&(crc_list[1]), msg->data, msg->tx_len - 1);
-	msg->data[msg->tx_len - 1] = cal_crc8_pec(crc_list, msg->tx_len);
-
-	// Write (Prepare read)
-	if (i2c_master_write(msg, retry)) {
-		LOG_ERR("Failed to write, 0x%X not set", address);
-		ret = KB900X_E_I2C_ERROR;
-		goto exit;
-	}
-
-	// Read
-	memset(msg->data, 0, I2C_BUFF_SIZE);
-	msg->tx_len = 1;
-	msg->rx_len = 1 + KB900X_REGISTER_ADDRESS_WIDTH + KB900X_REGISTER_VALUE_WIDTH +
-		      1; // Bytecnt + address + value + PEC
-	retry = 0;
+	uint8_t retry = 0;
 	do {
 		retry++;
+		uint8_t payload_offset = 0;
+		// Command code
+		msg->data[payload_offset++] = KB900X_CCODE_START_READ_FUNC2;
+		// Bytecnt
+		msg->data[payload_offset++] = KB900X_REGISTER_ADDRESS_WIDTH;
+		for (int i = 0; i < KB900X_REGISTER_ADDRESS_WIDTH; i++) {
+			msg->data[payload_offset + i] = (address >> (i * 8)) & 0xFF;
+		}
+		payload_offset += KB900X_REGISTER_ADDRESS_WIDTH;
+		msg->tx_len = payload_offset + 1; // + PEC
+
+		// PEC signature
+		uint8_t crc_list[msg->tx_len];
+		crc_list[0] = msg->target_addr << 1;
+		memcpy(&(crc_list[1]), msg->data, msg->tx_len - 1);
+		msg->data[msg->tx_len - 1] = cal_crc8_pec(crc_list, msg->tx_len);
+
+		// Write (Prepare read)
+		if (i2c_master_write(msg, KB900X_MAX_RETRY)) {
+			LOG_ERR("Failed to write, 0x%X not set", address);
+			ret = KB900X_E_I2C_ERROR;
+			goto exit;
+		}
+
+		// Read
+		memset(msg->data, 0, I2C_BUFF_SIZE);
+		msg->tx_len = 1;
+		msg->rx_len = 1 + KB900X_REGISTER_ADDRESS_WIDTH + KB900X_REGISTER_VALUE_WIDTH +
+			      1; // Bytecnt + address + value + PEC
 		msg->data[0] = KB900X_CCODE_END_READ_FUNC2;
 		if (i2c_master_read(msg, KB900X_MAX_RETRY)) {
 			LOG_ERR("Failed to read PCIE RETIMER addr 0x%X", address);
@@ -349,10 +315,7 @@ kb900x_error_t smbus_read_register(I2C_MSG *msg, uint32_t address, uint32_t *val
 	}
 
 exit:
-	if (k_mutex_unlock(&kb900x_mutex)) {
-		LOG_ERR("kb900x mutex unlock failed");
-		ret = KB900X_E_MUX_UNLOCK_FAILED;
-	}
+	UNLOCK_MUTEX(kb900x_mutex, KB900X_E_MUX_UNLOCK_FAILED);
 	return ret;
 }
 
@@ -370,21 +333,9 @@ kb900x_error_t smbus_write_register(I2C_MSG *msg, uint32_t address, uint32_t val
 {
 	CHECK_NULL_ARG_WITH_RETURN(msg, KB900X_E_INVALID_ARG);
 
-	uint8_t retry = 0;
 	kb900x_error_t ret = KB900X_E_OK;
 
-	// Lock mutex
-	for (; retry < KB900X_MAX_RETRY; retry++) {
-		if (k_mutex_lock(&kb900x_mutex, K_MSEC(KB900X_MUTEX_LOCK_MS))) {
-			k_msleep(10);
-		} else {
-			break;
-		}
-	}
-	if (retry == KB900X_MAX_RETRY) {
-		LOG_ERR("kb900x mutex lock failed");
-		return KB900X_E_MUX_LOCK_FAILED;
-	}
+	KB900X_LOCK_MUTEX(kb900x_mutex, KB900X_E_MUX_LOCK_FAILED);
 
 	uint8_t payload_offset = 0;
 	// Command code
@@ -408,17 +359,14 @@ kb900x_error_t smbus_write_register(I2C_MSG *msg, uint32_t address, uint32_t val
 	msg->data[msg->tx_len - 1] = cal_crc8_pec(crc_list, msg->tx_len);
 
 	// Write
-	if (i2c_master_write(msg, retry)) {
+	if (i2c_master_write(msg, KB900X_MAX_RETRY)) {
 		LOG_ERR("Failed to write, 0x%X not set", address);
 		ret = KB900X_E_I2C_ERROR;
 		goto exit;
 	}
 
 exit:
-	if (k_mutex_unlock(&kb900x_mutex)) {
-		LOG_ERR("kb900x mutex unlock failed");
-		ret = KB900X_E_MUX_UNLOCK_FAILED;
-	}
+	UNLOCK_MUTEX(kb900x_mutex, KB900X_E_MUX_UNLOCK_FAILED);
 	return ret;
 }
 
@@ -452,7 +400,7 @@ kb900x_error_t kb900x_write_register(I2C_MSG *msg, uint32_t address, uint32_t va
 	return kb900x_register_io.write(msg, address, value);
 }
 
-kb900x_error_t kb900x_get_vendor_id_with_err_code(I2C_MSG *msg, int *vendor_id)
+bool kb900x_get_vendor_id(I2C_MSG *msg, int *vendor_id)
 {
 	CHECK_NULL_ARG_WITH_RETURN(msg, KB900X_E_INVALID_ARG);
 	CHECK_NULL_ARG_WITH_RETURN(vendor_id, KB900X_E_INVALID_ARG);
@@ -462,17 +410,13 @@ kb900x_error_t kb900x_get_vendor_id_with_err_code(I2C_MSG *msg, int *vendor_id)
 		uint8_t bytecnt = msg->data[0];
 		*vendor_id = msg->data[bytecnt - 3] + (msg->data[bytecnt - 2] << 8) +
 			     (msg->data[bytecnt - 1] << 16) + (msg->data[bytecnt] << 24);
+	} else {
+		LOG_ERR("Failed to read vendor ID with error code: %d", status);
 	}
-	return status;
+	return (status == KB900X_E_OK);
 }
 
-bool kb900x_get_vendor_id(I2C_MSG *msg, int *vendor_id)
-{
-	const kb900x_error_t status = kb900x_get_vendor_id_with_err_code(msg, vendor_id);
-	return status == KB900X_E_OK;
-}
-
-kb900x_error_t kb900x_get_fw_version_with_err_code(I2C_MSG *msg, uint8_t *version)
+bool kb900x_get_fw_version(I2C_MSG *msg, uint8_t *version)
 {
 	CHECK_NULL_ARG_WITH_RETURN(msg, KB900X_E_INVALID_ARG);
 	CHECK_NULL_ARG_WITH_RETURN(version, KB900X_E_INVALID_ARG);
@@ -484,15 +428,11 @@ kb900x_error_t kb900x_get_fw_version_with_err_code(I2C_MSG *msg, uint8_t *versio
 		for (uint8_t i = 0; i < (bytecnt - 2); i++) {
 			version[i] = msg->data[bytecnt - i];
 		}
+	} else {
+		LOG_ERR("Failed to read firmware version with error code: %d", status);
 	}
 
-	return status;
-}
-
-bool kb900x_get_fw_version(I2C_MSG *msg, uint8_t *version)
-{
-	const kb900x_error_t status = kb900x_get_fw_version_with_err_code(msg, version);
-	return status == KB900X_E_OK;
+	return (status == KB900X_E_OK);
 }
 
 kb900x_error_t kb900x_get_firmware_health(I2C_MSG *msg, kb900x_fw_health_t *firmware_health)
@@ -596,21 +536,9 @@ kb900x_error_t kb900x_i2c_master_check_status(I2C_MSG *msg);
 
 kb900x_error_t kb900x_i2c_master_init(I2C_MSG *msg, uint8_t slave_addr)
 {
-	uint8_t retry = 0;
 	int ret = KB900X_E_OK;
 
-	// Lock mutex
-	for (; retry < KB900X_MAX_RETRY; retry++) {
-		if (k_mutex_lock(&kb900x_i2c_master_mutex, K_MSEC(KB900X_MUTEX_LOCK_MS))) {
-			k_msleep(10);
-		} else {
-			break;
-		}
-	}
-	if (retry == KB900X_MAX_RETRY) {
-		LOG_ERR("kb900x i2c master mutex lock failed");
-		return KB900X_E_MUX_LOCK_FAILED;
-	}
+	KB900X_LOCK_MUTEX(kb900x_i2c_master_mutex, KB900X_E_MUX_LOCK_FAILED);
 
 	// Enable clock for I2C Master
 	uint32_t payload = 0x1F;
@@ -654,11 +582,7 @@ kb900x_error_t kb900x_i2c_master_init(I2C_MSG *msg, uint8_t slave_addr)
 		goto exit;
 	}
 exit:
-	if (k_mutex_unlock(&kb900x_i2c_master_mutex)) {
-		LOG_ERR("kb900x i2c master mutex unlock failed");
-		ret = KB900X_E_MUX_UNLOCK_FAILED;
-	}
-
+	UNLOCK_MUTEX(kb900x_i2c_master_mutex, KB900X_E_MUX_UNLOCK_FAILED);
 	return ret;
 }
 
@@ -688,21 +612,7 @@ kb900x_error_t kb900x_i2c_master_write(I2C_MSG *msg, uint8_t slave_addr, uint8_t
 		goto exit;
 	}
 
-	uint8_t retry = 0;
-
-	// Lock mutex
-	for (; retry < KB900X_MAX_RETRY; retry++) {
-		if (k_mutex_lock(&kb900x_i2c_master_mutex, K_MSEC(KB900X_MUTEX_LOCK_MS))) {
-			k_msleep(10);
-		} else {
-			break;
-		}
-	}
-	if (retry == KB900X_MAX_RETRY) {
-		LOG_ERR("kb900x i2c master mutex lock failed");
-		ret = KB900X_E_MUX_LOCK_FAILED;
-		return ret;
-	}
+	KB900X_LOCK_MUTEX(kb900x_i2c_master_mutex, KB900X_E_MUX_LOCK_FAILED);
 
 	// Change slave address if needed
 	if (slave_addr != kb900x_eeprom_slave_addr) {
@@ -754,11 +664,7 @@ kb900x_error_t kb900x_i2c_master_write(I2C_MSG *msg, uint8_t slave_addr, uint8_t
 		}
 	}
 exit:
-	if (k_mutex_unlock(&kb900x_i2c_master_mutex)) {
-		LOG_ERR("kb900x i2c master mutex unlock failed");
-		ret = KB900X_E_MUX_UNLOCK_FAILED;
-	}
-
+	UNLOCK_MUTEX(kb900x_i2c_master_mutex, KB900X_E_MUX_UNLOCK_FAILED);
 	return ret;
 }
 
@@ -791,21 +697,9 @@ kb900x_error_t kb900x_i2c_master_read(I2C_MSG *msg, uint8_t slave_addr, uint8_t 
 		return KB900X_E_INVALID_ARG;
 	}
 
-	uint8_t retry = 0;
 	kb900x_error_t ret = KB900X_E_OK;
 
-	// Lock mutex
-	for (; retry < KB900X_MAX_RETRY; retry++) {
-		if (k_mutex_lock(&kb900x_i2c_master_mutex, K_MSEC(KB900X_MUTEX_LOCK_MS))) {
-			k_msleep(10);
-		} else {
-			break;
-		}
-	}
-	if (retry == KB900X_MAX_RETRY) {
-		LOG_ERR("kb900x i2c master mutex lock failed");
-		return KB900X_E_MUX_LOCK_FAILED;
-	}
+	KB900X_LOCK_MUTEX(kb900x_i2c_master_mutex, KB900X_E_MUX_LOCK_FAILED);
 
 	if (!skip_addr) {
 		// Send address
@@ -867,11 +761,7 @@ kb900x_error_t kb900x_i2c_master_read(I2C_MSG *msg, uint8_t slave_addr, uint8_t 
 		result[i] = tmp_val & 0xFF;
 	}
 exit:
-	if (k_mutex_unlock(&kb900x_i2c_master_mutex)) {
-		LOG_ERR("kb900x i2c master mutex unlock failed");
-		ret = KB900X_E_MUX_UNLOCK_FAILED;
-	}
-
+	UNLOCK_MUTEX(kb900x_i2c_master_mutex, KB900X_E_MUX_UNLOCK_FAILED);
 	return ret;
 }
 
@@ -890,19 +780,7 @@ kb900x_error_t kb900x_i2c_master_set_slave_address(I2C_MSG *msg, uint8_t slave_a
 
 	kb900x_error_t ret = KB900X_E_OK;
 
-	// Lock mutex
-	uint8_t retry = 0;
-	for (; retry < KB900X_MAX_RETRY; retry++) {
-		if (k_mutex_lock(&kb900x_i2c_master_mutex, K_MSEC(KB900X_MUTEX_LOCK_MS))) {
-			k_msleep(10);
-		} else {
-			break;
-		}
-	}
-	if (retry == KB900X_MAX_RETRY) {
-		LOG_ERR("kb900x i2c master mutex lock failed");
-		return KB900X_E_MUX_LOCK_FAILED;
-	}
+	KB900X_LOCK_MUTEX(kb900x_i2c_master_mutex, KB900X_E_MUX_LOCK_FAILED);
 
 	ret = kb900x_i2c_master_enable(msg, false, false);
 	if (ret != KB900X_E_OK) {
@@ -921,11 +799,7 @@ kb900x_error_t kb900x_i2c_master_set_slave_address(I2C_MSG *msg, uint8_t slave_a
 		goto exit;
 	}
 exit:
-	if (k_mutex_unlock(&kb900x_i2c_master_mutex)) {
-		LOG_ERR("kb900x i2c master mutex unlock failed");
-		ret = KB900X_E_MUX_UNLOCK_FAILED;
-	}
-
+	UNLOCK_MUTEX(kb900x_i2c_master_mutex, KB900X_E_MUX_UNLOCK_FAILED);
 	return ret;
 }
 
@@ -943,21 +817,9 @@ kb900x_error_t kb900x_i2c_master_enable(I2C_MSG *msg, bool enable, bool block_fi
 {
 	CHECK_NULL_ARG_WITH_RETURN(msg, KB900X_E_INVALID_ARG);
 
-	uint8_t retry = 0;
 	kb900x_error_t ret = KB900X_E_OK;
 
-	// Lock mutex
-	for (; retry < KB900X_MAX_RETRY; retry++) {
-		if (k_mutex_lock(&kb900x_i2c_master_mutex, K_MSEC(KB900X_MUTEX_LOCK_MS))) {
-			k_msleep(10);
-		} else {
-			break;
-		}
-	}
-	if (retry == KB900X_MAX_RETRY) {
-		LOG_ERR("kb900x i2c master mutex lock failed");
-		return KB900X_E_MUX_LOCK_FAILED;
-	}
+	KB900X_LOCK_MUTEX(kb900x_i2c_master_mutex, KB900X_E_MUX_LOCK_FAILED);
 
 	const uint32_t value = ((uint32_t)(block_fifo) << 2) | (uint32_t)(enable);
 	ret = kb900x_register_io.write(msg, kb900x_ee_IC_ENABLE, value);
@@ -966,11 +828,7 @@ kb900x_error_t kb900x_i2c_master_enable(I2C_MSG *msg, bool enable, bool block_fi
 		goto exit;
 	}
 exit:
-	if (k_mutex_unlock(&kb900x_i2c_master_mutex)) {
-		LOG_ERR("kb900x i2c master mutex unlock failed");
-		ret = KB900X_E_MUX_UNLOCK_FAILED;
-	}
-
+	UNLOCK_MUTEX(kb900x_i2c_master_mutex, KB900X_E_MUX_UNLOCK_FAILED);
 	return ret;
 }
 
@@ -986,26 +844,14 @@ kb900x_error_t kb900x_i2c_master_wait_for_inactivity(I2C_MSG *msg)
 {
 	CHECK_NULL_ARG_WITH_RETURN(msg, KB900X_E_INVALID_ARG);
 
-	uint32_t retry = 0;
 	kb900x_error_t ret = KB900X_E_OK;
 
-	// Lock mutex
-	for (; retry < KB900X_MAX_RETRY; retry++) {
-		if (k_mutex_lock(&kb900x_i2c_master_mutex, K_MSEC(KB900X_MUTEX_LOCK_MS))) {
-			k_msleep(10);
-		} else {
-			break;
-		}
-	}
-	if (retry == KB900X_MAX_RETRY) {
-		LOG_ERR("kb900x i2c master mutex lock failed");
-		return KB900X_E_MUX_LOCK_FAILED;
-	}
+	KB900X_LOCK_MUTEX(kb900x_i2c_master_mutex, KB900X_E_MUX_LOCK_FAILED);
 
 	const size_t nb_retry = 1000;
 	uint32_t result;
 	const uint32_t mask = 0x20;
-	retry = 0;
+	uint32_t retry = 0;
 	for (; retry < nb_retry; retry++) {
 		ret = kb900x_register_io.read(msg, kb900x_ee_IC_STATUS, &result);
 		if (ret != KB900X_E_OK) {
@@ -1019,11 +865,7 @@ kb900x_error_t kb900x_i2c_master_wait_for_inactivity(I2C_MSG *msg)
 	LOG_ERR("TIMEOUT while waiting for inactivity!");
 	ret = KB900X_E_TIMEOUT;
 exit:
-	if (k_mutex_unlock(&kb900x_i2c_master_mutex)) {
-		LOG_ERR("kb900x i2c master mutex unlock failed");
-		ret = KB900X_E_MUX_UNLOCK_FAILED;
-	}
-
+	UNLOCK_MUTEX(kb900x_i2c_master_mutex, KB900X_E_MUX_UNLOCK_FAILED);
 	return ret;
 }
 
@@ -1041,21 +883,9 @@ kb900x_error_t kb900x_i2c_master_check_status(I2C_MSG *msg)
 {
 	CHECK_NULL_ARG_WITH_RETURN(msg, KB900X_E_INVALID_ARG);
 
-	uint8_t retry = 0;
 	kb900x_error_t ret = KB900X_E_OK;
 
-	// Lock mutex
-	for (; retry < KB900X_MAX_RETRY; retry++) {
-		if (k_mutex_lock(&kb900x_i2c_master_mutex, K_MSEC(KB900X_MUTEX_LOCK_MS))) {
-			k_msleep(10);
-		} else {
-			break;
-		}
-	}
-	if (retry == KB900X_MAX_RETRY) {
-		LOG_ERR("kb900x i2c master mutex lock failed");
-		return KB900X_E_MUX_LOCK_FAILED;
-	}
+	KB900X_LOCK_MUTEX(kb900x_i2c_master_mutex, KB900X_E_MUX_LOCK_FAILED);
 
 	uint32_t result;
 	const uint32_t mask = 0x40;
@@ -1076,11 +906,7 @@ kb900x_error_t kb900x_i2c_master_check_status(I2C_MSG *msg)
 	}
 
 exit:
-	if (k_mutex_unlock(&kb900x_i2c_master_mutex)) {
-		LOG_ERR("kb900x i2c master mutex unlock failed");
-		ret = KB900X_E_MUX_UNLOCK_FAILED;
-	}
-
+	UNLOCK_MUTEX(kb900x_i2c_master_mutex, KB900X_E_MUX_UNLOCK_FAILED);
 	return ret;
 }
 
@@ -1101,21 +927,9 @@ kb900x_error_t kb900x_write_field(I2C_MSG *msg, uint32_t addr, uint8_t field_wid
 {
 	CHECK_NULL_ARG_WITH_RETURN(msg, KB900X_E_INVALID_ARG);
 
-	uint8_t retry = 0;
 	kb900x_error_t ret = KB900X_E_OK;
 
-	// Lock mutex
-	for (; retry < KB900X_MAX_RETRY; retry++) {
-		if (k_mutex_lock(&kb900x_i2c_master_mutex, K_MSEC(KB900X_MUTEX_LOCK_MS))) {
-			k_msleep(10);
-		} else {
-			break;
-		}
-	}
-	if (retry == KB900X_MAX_RETRY) {
-		LOG_ERR("kb900x i2c master mutex lock failed");
-		return KB900X_E_MUX_LOCK_FAILED;
-	}
+	KB900X_LOCK_MUTEX(kb900x_i2c_master_mutex, KB900X_E_MUX_LOCK_FAILED);
 
 	uint32_t reg_val;
 	ret = kb900x_register_io.read(msg, addr, &reg_val);
@@ -1137,11 +951,7 @@ kb900x_error_t kb900x_write_field(I2C_MSG *msg, uint32_t addr, uint8_t field_wid
 		goto exit;
 	}
 exit:
-	if (k_mutex_unlock(&kb900x_i2c_master_mutex)) {
-		LOG_ERR("kb900x i2c master mutex unlock failed");
-		ret = KB900X_E_MUX_UNLOCK_FAILED;
-	}
-
+	UNLOCK_MUTEX(kb900x_i2c_master_mutex, KB900X_E_MUX_UNLOCK_FAILED);
 	return ret;
 }
 
@@ -1163,21 +973,9 @@ kb900x_error_t kb900x_read_field(I2C_MSG *msg, uint32_t addr, uint8_t field_widt
 	CHECK_NULL_ARG_WITH_RETURN(value, KB900X_E_INVALID_ARG);
 	CHECK_NULL_ARG_WITH_RETURN(msg, KB900X_E_INVALID_ARG);
 
-	uint8_t retry = 0;
 	kb900x_error_t ret = KB900X_E_OK;
 
-	// Lock mutex
-	for (; retry < KB900X_MAX_RETRY; retry++) {
-		if (k_mutex_lock(&kb900x_i2c_master_mutex, K_MSEC(KB900X_MUTEX_LOCK_MS))) {
-			k_msleep(10);
-		} else {
-			break;
-		}
-	}
-	if (retry == KB900X_MAX_RETRY) {
-		LOG_ERR("kb900x i2c master mutex lock failed");
-		return KB900X_E_MUX_LOCK_FAILED;
-	}
+	KB900X_LOCK_MUTEX(kb900x_i2c_master_mutex, KB900X_E_MUX_LOCK_FAILED);
 
 	uint32_t result;
 	ret = kb900x_register_io.read(msg, addr, &result);
@@ -1188,11 +986,7 @@ kb900x_error_t kb900x_read_field(I2C_MSG *msg, uint32_t addr, uint8_t field_widt
 	uint32_t mask = (1 << field_width) - 1;
 	*value = result >> field_lsb & mask;
 exit:
-	if (k_mutex_unlock(&kb900x_i2c_master_mutex)) {
-		LOG_ERR("kb900x i2c master mutex unlock failed");
-		ret = KB900X_E_MUX_UNLOCK_FAILED;
-	}
-
+	UNLOCK_MUTEX(kb900x_i2c_master_mutex, KB900X_E_MUX_UNLOCK_FAILED);
 	return ret;
 }
 
@@ -1201,7 +995,7 @@ exit:
 /************** EEPROM SECTION **************/
 
 kb900x_error_t kb900x_flash_firmware(I2C_MSG *msg, uint32_t addr, uint8_t *payload,
-				     size_t payload_size, kb900x_eeprom_config_t *config)
+				     size_t payload_size, const kb900x_eeprom_config_t *config)
 {
 	CHECK_NULL_ARG_WITH_RETURN(payload, KB900X_E_INVALID_ARG);
 	CHECK_NULL_ARG_WITH_RETURN(config, KB900X_E_INVALID_ARG);
@@ -1360,7 +1154,7 @@ uint8_t kb900x_pcie_retimer_fw_update(I2C_MSG *msg, uint32_t offset, uint16_t ms
 }
 
 kb900x_error_t kb900x_read_firmware(I2C_MSG *msg, uint32_t addr, size_t length, uint8_t *result,
-				    kb900x_eeprom_config_t *config)
+				    const kb900x_eeprom_config_t *config)
 {
 	CHECK_NULL_ARG_WITH_RETURN(result, KB900X_E_INVALID_ARG);
 	CHECK_NULL_ARG_WITH_RETURN(config, KB900X_E_INVALID_ARG);
@@ -1419,7 +1213,7 @@ kb900x_error_t kb900x_read_firmware(I2C_MSG *msg, uint32_t addr, size_t length, 
 }
 
 kb900x_error_t kb900x_check_firmware(I2C_MSG *msg, uint32_t offset, uint8_t *buffer,
-				     uint32_t buffer_size, kb900x_eeprom_config_t *config)
+				     uint32_t buffer_size, const kb900x_eeprom_config_t *config)
 {
 	LOG_ERR("Not Yet Implemented");
 	return KB900X_E_NOT_IMPLEMENTED;
@@ -1688,7 +1482,7 @@ uint8_t kb900x_read(sensor_cfg *cfg, int *reading)
 		ret = kb900x_get_temperature(&msg, &temperature);
 		if (ret) {
 			LOG_ERR("KB900x: Failed to read temperature : %d", ret);
-			return ret;
+			return SENSOR_UNSPECIFIED_ERROR;
 		}
 		sensor_val *sval = (sensor_val *)reading;
 		memset(sval, 0, sizeof(*sval));
@@ -1718,8 +1512,8 @@ uint8_t kb900x_init(sensor_cfg *cfg)
 
 		kb900x_error_t ret = kb900x_init_smbus(&msg);
 		if (ret) {
-			LOG_ERR("KB900x: Failed to initialize SMBUS : %d", ret);
-			return SENSOR_FAIL_TO_ACCESS;
+			LOG_ERR("KB900x: Failed to initialize kb900x : %d", ret);
+			return SENSOR_INIT_UNSPECIFIED_ERROR;
 		}
 	}
 	init_args->is_init = true;

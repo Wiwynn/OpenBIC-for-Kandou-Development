@@ -74,7 +74,7 @@ typedef enum {
 	KB900X_E_MUX_UNLOCK_FAILED = -4, /**< Mutex unlock failed */
 	KB900X_E_I2C_ERROR = -5, /**< I2C error */
 	KB900X_E_CRC_ERROR = -6, /**< CRC error */
-	KB900X_E_TIMEOUT = -7, /**< I2C Timeout */
+	KB900X_E_TIMEOUT = -7, /**< I2C Master Timeout */
 	KB900X_E_FW_WRITE_ERROR = -8, /**< Firmware write error */
 	KB900X_E_COMM = -9, /**< Communication error */
 	KB900X_E_FW_NOT_READY = -10, /**< Firmware not ready to switch to SMBus */
@@ -310,7 +310,7 @@ kb900x_error_t kb900x_i2c_master_init(I2C_MSG *msg, uint8_t slave_addr);
  * \return error code, KB900X_E_OK if successful, otherwise an other error code
  */
 kb900x_error_t kb900x_read_firmware(I2C_MSG *msg, uint32_t addr, size_t length, uint8_t *result,
-				    kb900x_eeprom_config_t *config);
+				    const kb900x_eeprom_config_t *config);
 
 /** \brief Compare the content of the EEPROM with expected data.
  *
@@ -324,7 +324,7 @@ kb900x_error_t kb900x_read_firmware(I2C_MSG *msg, uint32_t addr, size_t length, 
  * \return 0 if no error, else the error code
  */
 kb900x_error_t kb900x_check_firmware(I2C_MSG *msg, uint32_t offset, uint8_t *buffer,
-				     uint32_t buffer_size, kb900x_eeprom_config_t *config);
+				     uint32_t buffer_size, const kb900x_eeprom_config_t *config);
 
 /** \brief Flash the firmware.
  *
@@ -338,7 +338,7 @@ kb900x_error_t kb900x_check_firmware(I2C_MSG *msg, uint32_t offset, uint8_t *buf
  * \return error code, KB900X_E_OK if successful, otherwise an other error code
  */
 kb900x_error_t kb900x_flash_firmware(I2C_MSG *msg, uint32_t addr, uint8_t *payload,
-				     size_t payload_size, kb900x_eeprom_config_t *config);
+				     size_t payload_size, const kb900x_eeprom_config_t *config);
 
 /**
  * \brief Write the KB900X firmware to the KB900X firmware EEPROM.
@@ -358,17 +358,6 @@ uint8_t kb900x_pcie_retimer_fw_update(I2C_MSG *msg, uint32_t offset, uint16_t ms
 /************** KB900X EEPROM READ/WRITE SECTION END **************/
 
 /************** KB900X SMBUS COMMANDS **************/
-
-/**
- * \brief Get the KB900X vendor ID.
- *
- * \param[in] msg I2C_MSG structure to communicate with KB900X,
- *               `msg->target_addr` and `msg->bus` must be set by the caller to point to KB900X
- * \param[out] vendor_id a pointer to the integer used to store the vendor ID
- *
- * \return error code, KB900X_E_OK if successful, otherwise an other error code
- */
-kb900x_error_t kb900x_get_vendor_id_with_err_code(I2C_MSG *msg, int *vendor_id);
 
 /**
  * \brief Get the KB900X vendor ID.
@@ -410,18 +399,6 @@ kb900x_error_t kb900x_get_temperature(I2C_MSG *msg, float *temperature);
  * \return error code, KB900X_E_OK if successful, otherwise an other error code
  */
 kb900x_error_t kb900x_get_lane_temperature(I2C_MSG *msg, int port, int lane, float *temperature);
-
-/**
- * \brief Get the KB900X firmware version.
- *
- * \param[in] msg I2C_MSG structure to communicate with KB900X,
- *               `msg->target_addr` and `msg->bus` must be set by the caller to point to KB900X
- * \param[out] version a pointer to the uint8_t array used to store the firmware version;
- *              the array must be at least 4 bytes long
- *
- * \return error code, KB900X_E_OK if successful, otherwise an other error code
- */
-kb900x_error_t kb900x_get_fw_version_with_err_code(I2C_MSG *msg, uint8_t *version);
 
 /**
  * \brief Get the KB900X firmware version.
