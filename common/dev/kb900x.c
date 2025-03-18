@@ -39,13 +39,20 @@ K_MUTEX_DEFINE(kb900x_mutex);
 		}                                                                                  \
 	}
 
-#define UNLOCK_MUTEX(mutex, fail_return_type)                                                      \
+#define KB900X_UNLOCK_MUTEX(mutex, fail_return_type)                                               \
 	{                                                                                          \
 		if (k_mutex_unlock(&(mutex))) {                                                    \
 			LOG_ERR("kb900x i2c master mutex unlock failed");                          \
 			return (fail_return_type);                                                 \
 		}                                                                                  \
 	}
+
+#define KB900X_PARSE_VALUE(msg, value)                                                             \
+	do {                                                                                       \
+		const uint8_t bytecnt = msg->data[0];                                              \
+		value = (msg->data[bytecnt - 3] + (msg->data[bytecnt - 2] << 8) +                  \
+			 (msg->data[bytecnt - 1] << 16) + (msg->data[bytecnt] << 24));             \
+	} while (0)
 
 kb900x_error_t kb900x_write_register(I2C_MSG *msg, uint32_t address, uint32_t value);
 kb900x_error_t kb900x_read_register(I2C_MSG *msg, uint32_t address, uint32_t *value);
@@ -140,7 +147,7 @@ kb900x_error_t smbus_read_command(I2C_MSG *msg, uint16_t offsets)
 	}
 
 exit:
-	UNLOCK_MUTEX(kb900x_mutex, KB900X_E_MUX_UNLOCK_FAILED);
+	KB900X_UNLOCK_MUTEX(kb900x_mutex, KB900X_E_MUX_UNLOCK_FAILED);
 	return ret;
 }
 
@@ -196,7 +203,7 @@ kb900x_error_t twi_read_register(I2C_MSG *msg, uint32_t address, uint32_t *value
 	}
 
 exit:
-	UNLOCK_MUTEX(kb900x_mutex, KB900X_E_MUX_UNLOCK_FAILED);
+	KB900X_UNLOCK_MUTEX(kb900x_mutex, KB900X_E_MUX_UNLOCK_FAILED);
 	return ret;
 }
 
@@ -240,7 +247,7 @@ kb900x_error_t twi_write_register(I2C_MSG *msg, uint32_t address, uint32_t value
 	}
 
 exit:
-	UNLOCK_MUTEX(kb900x_mutex, KB900X_E_MUX_UNLOCK_FAILED);
+	KB900X_UNLOCK_MUTEX(kb900x_mutex, KB900X_E_MUX_UNLOCK_FAILED);
 	return ret;
 }
 
@@ -254,7 +261,7 @@ exit:
  *
  * \return error code, KB900X_E_OK if successful, otherwise an other error code
  */
-kb900x_error_t smbus_read_register(I2C_MSG *msg, uint32_t address, uint32_t *value)
+kb900x_error_t smbus_read_register(I2C_MSG *msg, const uint32_t address, uint32_t *value)
 {
 	CHECK_NULL_ARG_WITH_RETURN(value, KB900X_E_INVALID_ARG);
 	CHECK_NULL_ARG_WITH_RETURN(msg, KB900X_E_INVALID_ARG);
@@ -315,7 +322,7 @@ kb900x_error_t smbus_read_register(I2C_MSG *msg, uint32_t address, uint32_t *val
 	}
 
 exit:
-	UNLOCK_MUTEX(kb900x_mutex, KB900X_E_MUX_UNLOCK_FAILED);
+	KB900X_UNLOCK_MUTEX(kb900x_mutex, KB900X_E_MUX_UNLOCK_FAILED);
 	return ret;
 }
 
@@ -329,7 +336,7 @@ exit:
  *
  * \return error code, KB900X_E_OK if successful, otherwise an other error code
  */
-kb900x_error_t smbus_write_register(I2C_MSG *msg, uint32_t address, uint32_t value)
+kb900x_error_t smbus_write_register(I2C_MSG *msg, const uint32_t address, uint32_t value)
 {
 	CHECK_NULL_ARG_WITH_RETURN(msg, KB900X_E_INVALID_ARG);
 
@@ -366,8 +373,68 @@ kb900x_error_t smbus_write_register(I2C_MSG *msg, uint32_t address, uint32_t val
 	}
 
 exit:
-	UNLOCK_MUTEX(kb900x_mutex, KB900X_E_MUX_UNLOCK_FAILED);
+	KB900X_UNLOCK_MUTEX(kb900x_mutex, KB900X_E_MUX_UNLOCK_FAILED);
 	return ret;
+}
+
+/**
+ * \brief Read the bifurcation and deduce the maximum number of links possible
+ *
+ * \param[in] msg I2C_MSG structure to communicate with KB900X,
+ *                `msg->target_addr` and `msg->bus` must be set by the caller to point to KB900X
+ * \param[out] max_nb_links a pointer to the uint8_t used to store the result
+ *
+ * \return error code, KB900X_E_OK if successful, otherwise an other error code
+ */
+kb900x_error_t kb900x_get_max_nb_links(I2C_MSG *msg, uint8_t *max_nb_links)
+{
+	// Array mapping bifurcation modes to the number of links
+	const uint8_t bifurcation_links_map[KB900X_BIFUR_MODE_COUNT] = {
+		[KB900X_BIFUR_MODE_x16] = 1,
+		[KB900X_BIFUR_MODE_x0x0x8] = 1,
+		[KB900X_BIFUR_MODE_x0x0x0x4] = 1,
+		[KB900X_BIFUR_MODE_x8x8] = 2,
+		[KB900X_BIFUR_MODE_x8x4x4] = 3,
+		[KB900X_BIFUR_MODE_x4x4x8] = 3,
+		[KB900X_BIFUR_MODE_x4x4x4x4] = 4,
+		[KB900X_BIFUR_MODE_x2x2x2x2x2x2x2x2] = 8,
+		[KB900X_BIFUR_MODE_x8x4x2x2] = 4,
+		[KB900X_BIFUR_MODE_x8x2x2x4] = 4,
+		[KB900X_BIFUR_MODE_x2x2x4x8] = 4,
+		[KB900X_BIFUR_MODE_x4x2x2x8] = 4,
+		[KB900X_BIFUR_MODE_x2x2x2x2x8] = 5,
+		[KB900X_BIFUR_MODE_x8x2x2x2x2] = 5,
+		[KB900X_BIFUR_MODE_x2x2x4x4x4] = 5,
+		[KB900X_BIFUR_MODE_x4x2x2x4x4] = 5,
+		[KB900X_BIFUR_MODE_x4x4x2x2x4] = 5,
+		[KB900X_BIFUR_MODE_x4x4x4x2x2] = 5,
+		[KB900X_BIFUR_MODE_x2x2x2x2x4x4] = 6,
+		[KB900X_BIFUR_MODE_x2x2x4x2x2x4] = 6,
+		[KB900X_BIFUR_MODE_x4x2x2x2x2x4] = 6,
+		[KB900X_BIFUR_MODE_x2x2x4x4x2x2] = 6,
+		[KB900X_BIFUR_MODE_x4x2x2x4x2x2] = 6,
+		[KB900X_BIFUR_MODE_x4x4x2x2x2x2] = 6,
+		[KB900X_BIFUR_MODE_x2x2x2x2x2x2x4] = 7,
+		[KB900X_BIFUR_MODE_x2x2x2x2x4x2x2] = 7,
+		[KB900X_BIFUR_MODE_x2x2x4x2x2x2x2] = 7,
+		[KB900X_BIFUR_MODE_x4x2x2x2x2x2x2] = 7,
+		[KB900X_BIFUR_MODE_x4x4] = 2,
+		[KB900X_BIFUR_MODE_x2x2x4] = 3,
+		[KB900X_BIFUR_MODE_x4x2x2] = 3,
+		[KB900X_BIFUR_MODE_x2x2x2x2] = 4,
+		[KB900X_BIFUR_MODE_x2x2] = 2,
+	};
+	// Get the bifurcation
+	kb900x_error_t ret = smbus_read_command(msg, KB900x_SMBUS_OFFSET_BIFURCATION_MODE_INFO);
+	if (ret != KB900X_E_OK) {
+		LOG_ERR("Failed to get bifurcation setting from firmware config with error code: %d",
+			ret);
+		return ret;
+	}
+	uint32_t bifurcation_mode;
+	KB900X_PARSE_VALUE(msg, bifurcation_mode);
+	*max_nb_links = bifurcation_links_map[bifurcation_mode];
+	return KB900X_E_OK;
 }
 
 /**
@@ -435,22 +502,162 @@ bool kb900x_get_fw_version(I2C_MSG *msg, uint8_t *version)
 	return (status == KB900X_E_OK);
 }
 
-kb900x_error_t kb900x_get_firmware_health(I2C_MSG *msg, kb900x_fw_health_t *firmware_health)
+kb900x_error_t kb900x_get_hw_rtssm_logs(I2C_MSG *msg, kb900x_rtssm_all_logs_t *logs)
 {
-	LOG_ERR("Not Yet Implemented");
-	return KB900X_E_NOT_IMPLEMENTED;
+	CHECK_NULL_ARG_WITH_RETURN(msg, KB900X_E_INVALID_ARG);
+	CHECK_NULL_ARG_WITH_RETURN(logs, KB900X_E_INVALID_ARG);
+
+	// Ask to prepare data
+	kb900x_error_t ret = smbus_read_command(msg, KB900X_SMBUS_OFFSET_RTSSM_DUMP_REQ);
+	if (ret != KB900X_E_OK) {
+		LOG_ERR("Failed to request RTSSM logs with error code: %d", ret);
+		return ret;
+	}
+	// Check request status
+	uint8_t nb_try = KB900X_REQ_MAX_RETRY;
+	kb900x_feature_req_status_t status = KB900X_FEATURE_REQ_STATUS_IN_PROGRESS;
+	while (nb_try > 0 && status == KB900X_FEATURE_REQ_STATUS_IN_PROGRESS) {
+		ret = smbus_read_command(msg, KB900X_SMBUS_OFFSET_RTSSM_DUMP_REQ_STATUS);
+		if (ret != KB900X_E_OK) {
+			LOG_ERR("Failed to get RTSSM logs status with error code: %d", ret);
+			return ret;
+		}
+		KB900X_PARSE_VALUE(msg, status);
+		nb_try--;
+	}
+	if (status != KB900X_FEATURE_REQ_STATUS_SUCCESS) {
+		LOG_ERR("Failed to get RTSSM logs - status : %d", status);
+		return KB900X_E_FW_ERROR;
+	}
+	// Get the logs
+	// Get start address
+	ret = smbus_read_command(msg, KB900X_SMBUS_OFFSET_RTSSM_DUMP_START_ADDR);
+	if (ret != KB900X_E_OK) {
+		LOG_ERR("Failed to get RTSSM logs start addr with error code: %d", ret);
+		return ret;
+	}
+	uint32_t start_address;
+	KB900X_PARSE_VALUE(msg, start_address);
+	// Get length in bytes
+	ret = smbus_read_command(msg, KB900X_SMBUS_OFFSET_RTSSM_DUMP_LENGTH);
+	if (ret != KB900X_E_OK) {
+		LOG_ERR("Failed to get RTSSM logs length with error code: %d", ret);
+		return ret;
+	}
+	uint32_t length;
+	KB900X_PARSE_VALUE(msg, length);
+	// Get the number of links
+	uint8_t max_nb_links;
+	ret = kb900x_get_max_nb_links(msg, &max_nb_links);
+	if (ret != KB900X_E_OK) {
+		LOG_ERR("Error while getting the bifurcation setting of the Retimer");
+	}
+	// Deduce nb loggers depending on length
+	const uint8_t nb_registers_per_logger = 17; // 1 for log_map_info - 16 for entries
+	const uint8_t nb_bytes_per_registers = 4;
+	logs->nb_loggers = (length / nb_bytes_per_registers) / nb_registers_per_logger;
+	if (length / nb_bytes_per_registers < logs->nb_loggers * nb_registers_per_logger) {
+		LOG_ERR("Invalid HW RTSSM length - received %d, expected %d for %d loggers",
+			length / nb_bytes_per_registers, logs->nb_loggers * nb_registers_per_logger,
+			logs->nb_loggers);
+		return KB900X_E_FW_ERROR;
+	}
+	for (uint32_t i = 0; i < logs->nb_loggers; i++) {
+		for (uint8_t j = 0; j < nb_registers_per_logger; j++) {
+			uint32_t value;
+			ret = smbus_read_register(
+				msg,
+				start_address +
+					(i * (nb_registers_per_logger * nb_bytes_per_registers)) +
+					(j * nb_bytes_per_registers),
+				&value);
+			if (ret != KB900X_E_OK) {
+				LOG_ERR("Failed to read RTSSM logs with error code: %d", ret);
+				return ret;
+			}
+			if (j == 0) {
+				logs->logs[i].log_map_info = value;
+			} else {
+				logs->logs[i].entries[j * 2 - 2] = value & 0xFFFF;
+				logs->logs[i].entries[j * 2 - 1] = value >> 16;
+			}
+		}
+	}
+	return KB900X_E_OK;
 }
 
-kb900x_error_t kb900x_get_rtssm_dump(I2C_MSG *msg, uint32_t *buffer)
+kb900x_error_t kb900x_get_firmware_health(I2C_MSG *msg, kb900x_fw_health_t *firmware_health)
 {
-	LOG_ERR("Not Yet Implemented");
-	return KB900X_E_NOT_IMPLEMENTED;
+	CHECK_NULL_ARG_WITH_RETURN(msg, KB900X_E_INVALID_ARG);
+	CHECK_NULL_ARG_WITH_RETURN(firmware_health, KB900X_E_INVALID_ARG);
+
+	kb900x_error_t ret = smbus_read_command(msg, KB900X_SMBUS_OFFSET_FW_HEALTH);
+	if (ret != KB900X_E_OK) {
+		LOG_ERR("Failed to read FW health: %d", ret);
+		return ret;
+	}
+
+	// Parse response
+	const uint8_t bytecnt = msg->data[0];
+	firmware_health->liveliness = msg->data[bytecnt] >> 4;
+	firmware_health->fw_is_initialized = msg->data[bytecnt - 3] & 0x01;
+	return KB900X_E_OK;
 }
 
 kb900x_error_t kb900x_get_link_status(I2C_MSG *msg, int link_id, kb900x_link_status_t *link_status)
 {
-	LOG_ERR("Not Yet Implemented");
-	return KB900X_E_NOT_IMPLEMENTED;
+	CHECK_NULL_ARG_WITH_RETURN(msg, KB900X_E_INVALID_ARG);
+	CHECK_NULL_ARG_WITH_RETURN(link_status, KB900X_E_INVALID_ARG);
+	uint8_t max_nb_links;
+	kb900x_error_t ret = kb900x_get_max_nb_links(msg, &max_nb_links);
+	if (ret != KB900X_E_OK) {
+		LOG_ERR("Error while getting the bifurcation setting of the Retimer");
+	}
+	// FIXME number of links depending on bifurcation
+	if (link_id < 0 || link_id >= max_nb_links) {
+		LOG_ERR("Invalid link id: %d - Number of links (link indexing starts at 0): %d",
+			link_id, max_nb_links);
+		return KB900X_E_INVALID_ARG;
+	}
+
+	// Ask to prepare data
+	ret = smbus_read_command(msg, KB900X_SMBUS_OFFSET_LINK_STATUS_GATHER);
+	if (ret != KB900X_E_OK) {
+		LOG_ERR("Unable to trigger link status info gathering, err code: %d", ret);
+		return ret;
+	}
+	// Wait for data to be ready
+	uint8_t bytecnt;
+	uint8_t nb_try = KB900X_REQ_MAX_RETRY;
+	kb900x_feature_req_status_t status = KB900X_FEATURE_REQ_STATUS_IN_PROGRESS;
+	while (nb_try > 0 && status == KB900X_FEATURE_REQ_STATUS_IN_PROGRESS) {
+		if ((ret = smbus_read_command(msg, KB900X_SMBUS_OFFSET_LINK_STATUS_READY))) {
+			LOG_ERR("Failed to get link status with error code: %d", ret);
+			return ret;
+		}
+		KB900X_PARSE_VALUE(msg, status);
+		nb_try--;
+	}
+	if (status != KB900X_FEATURE_REQ_STATUS_SUCCESS) {
+		LOG_ERR("Failed to get link status - status : %d", status);
+		return KB900X_E_FW_ERROR;
+	}
+	// Fetch data
+	const uint8_t link_steps = 0x04;
+	ret = smbus_read_command(msg, KB900X_SMBUS_OFFSET_LINK_STATUS + (link_id * link_steps));
+	if (ret != KB900X_E_OK) {
+		LOG_ERR("Unable to read link status info for link %d, err code: %d", link_id, ret);
+		return ret;
+	}
+	bytecnt = msg->data[0];
+	link_status->raw = msg->data[bytecnt - 3] + (msg->data[bytecnt - 2] << 8) +
+			   (msg->data[bytecnt - 1] << 16) + (msg->data[bytecnt] << 24);
+	// Check for data validity
+	if (link_status->raw == 0xffffffff) {
+		LOG_ERR("Invalid link status info for link %d", link_id);
+		return KB900X_E_INVALID_DATA;
+	}
+	return KB900X_E_OK;
 }
 
 kb900x_error_t kb900x_get_temperature(I2C_MSG *msg, float *temperature)
@@ -509,11 +716,9 @@ kb900x_error_t kb900x_get_lane_temperature(I2C_MSG *msg, int port, int lane, flo
 	}
 
 	// Parse response
-	const uint8_t bytecnt = msg->data[0];
+	uint32_t raw_value_u32;
+	KB900X_PARSE_VALUE(msg, raw_value_u32);
 	const float divider = ((float)(1 << KB900X_FLOAT_PRECISION));
-	const uint32_t raw_value_u32 =
-		(msg->data[bytecnt - 3] + (msg->data[bytecnt - 2] << 8) +
-		 (msg->data[bytecnt - 1] << 16) + (msg->data[bytecnt] << 24));
 	*temperature = ABSOLUTE_ZER0 + ((float)(raw_value_u32)) / divider;
 	return KB900X_E_OK;
 }
@@ -582,7 +787,7 @@ kb900x_error_t kb900x_i2c_master_init(I2C_MSG *msg, uint8_t slave_addr)
 		goto exit;
 	}
 exit:
-	UNLOCK_MUTEX(kb900x_i2c_master_mutex, KB900X_E_MUX_UNLOCK_FAILED);
+	KB900X_UNLOCK_MUTEX(kb900x_i2c_master_mutex, KB900X_E_MUX_UNLOCK_FAILED);
 	return ret;
 }
 
@@ -664,7 +869,7 @@ kb900x_error_t kb900x_i2c_master_write(I2C_MSG *msg, uint8_t slave_addr, uint8_t
 		}
 	}
 exit:
-	UNLOCK_MUTEX(kb900x_i2c_master_mutex, KB900X_E_MUX_UNLOCK_FAILED);
+	KB900X_UNLOCK_MUTEX(kb900x_i2c_master_mutex, KB900X_E_MUX_UNLOCK_FAILED);
 	return ret;
 }
 
@@ -761,7 +966,7 @@ kb900x_error_t kb900x_i2c_master_read(I2C_MSG *msg, uint8_t slave_addr, uint8_t 
 		result[i] = tmp_val & 0xFF;
 	}
 exit:
-	UNLOCK_MUTEX(kb900x_i2c_master_mutex, KB900X_E_MUX_UNLOCK_FAILED);
+	KB900X_UNLOCK_MUTEX(kb900x_i2c_master_mutex, KB900X_E_MUX_UNLOCK_FAILED);
 	return ret;
 }
 
@@ -799,7 +1004,7 @@ kb900x_error_t kb900x_i2c_master_set_slave_address(I2C_MSG *msg, uint8_t slave_a
 		goto exit;
 	}
 exit:
-	UNLOCK_MUTEX(kb900x_i2c_master_mutex, KB900X_E_MUX_UNLOCK_FAILED);
+	KB900X_UNLOCK_MUTEX(kb900x_i2c_master_mutex, KB900X_E_MUX_UNLOCK_FAILED);
 	return ret;
 }
 
@@ -828,7 +1033,7 @@ kb900x_error_t kb900x_i2c_master_enable(I2C_MSG *msg, bool enable, bool block_fi
 		goto exit;
 	}
 exit:
-	UNLOCK_MUTEX(kb900x_i2c_master_mutex, KB900X_E_MUX_UNLOCK_FAILED);
+	KB900X_UNLOCK_MUTEX(kb900x_i2c_master_mutex, KB900X_E_MUX_UNLOCK_FAILED);
 	return ret;
 }
 
@@ -865,7 +1070,7 @@ kb900x_error_t kb900x_i2c_master_wait_for_inactivity(I2C_MSG *msg)
 	LOG_ERR("TIMEOUT while waiting for inactivity!");
 	ret = KB900X_E_TIMEOUT;
 exit:
-	UNLOCK_MUTEX(kb900x_i2c_master_mutex, KB900X_E_MUX_UNLOCK_FAILED);
+	KB900X_UNLOCK_MUTEX(kb900x_i2c_master_mutex, KB900X_E_MUX_UNLOCK_FAILED);
 	return ret;
 }
 
@@ -906,7 +1111,7 @@ kb900x_error_t kb900x_i2c_master_check_status(I2C_MSG *msg)
 	}
 
 exit:
-	UNLOCK_MUTEX(kb900x_i2c_master_mutex, KB900X_E_MUX_UNLOCK_FAILED);
+	KB900X_UNLOCK_MUTEX(kb900x_i2c_master_mutex, KB900X_E_MUX_UNLOCK_FAILED);
 	return ret;
 }
 
@@ -951,7 +1156,7 @@ kb900x_error_t kb900x_write_field(I2C_MSG *msg, uint32_t addr, uint8_t field_wid
 		goto exit;
 	}
 exit:
-	UNLOCK_MUTEX(kb900x_i2c_master_mutex, KB900X_E_MUX_UNLOCK_FAILED);
+	KB900X_UNLOCK_MUTEX(kb900x_i2c_master_mutex, KB900X_E_MUX_UNLOCK_FAILED);
 	return ret;
 }
 
@@ -986,7 +1191,7 @@ kb900x_error_t kb900x_read_field(I2C_MSG *msg, uint32_t addr, uint8_t field_widt
 	uint32_t mask = (1 << field_width) - 1;
 	*value = result >> field_lsb & mask;
 exit:
-	UNLOCK_MUTEX(kb900x_i2c_master_mutex, KB900X_E_MUX_UNLOCK_FAILED);
+	KB900X_UNLOCK_MUTEX(kb900x_i2c_master_mutex, KB900X_E_MUX_UNLOCK_FAILED);
 	return ret;
 }
 
@@ -1106,7 +1311,7 @@ kb900x_error_t kb900x_flash_firmware(I2C_MSG *msg, uint32_t addr, uint8_t *paylo
 	return KB900X_E_OK;
 }
 
-uint8_t kb900x_pcie_retimer_fw_update(I2C_MSG *msg, uint32_t offset, uint16_t msg_len,
+uint8_t kb900x_pcie_retimer_fw_update(I2C_MSG *msg, uint32_t offset, uint32_t msg_len,
 				      uint8_t *msg_buf, uint8_t flag)
 {
 	(void)flag;

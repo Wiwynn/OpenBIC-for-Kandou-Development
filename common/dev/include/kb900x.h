@@ -22,33 +22,43 @@
 #include "sensor.h"
 
 // Read SMBus command (2 bytes offset)
-#define KB900X_CCODE_START_READ_FUNC0 0x82
-#define KB900X_CCODE_END_READ_FUNC0 0x81
+#define KB900X_CCODE_START_READ_FUNC0 (0x82)
+#define KB900X_CCODE_END_READ_FUNC0 (0x81)
 // Read SMBus register (4 bytes offset)
-#define KB900X_CCODE_START_READ_FUNC2 0x8A
-#define KB900X_CCODE_END_READ_FUNC2 0x89
+#define KB900X_CCODE_START_READ_FUNC2 (0x8A)
+#define KB900X_CCODE_END_READ_FUNC2 (0x89)
 // Write SMBus register (4 bytes offset)
-#define KB900X_CCODE_START_END_WRITE_FUNC3 0x8F
+#define KB900X_CCODE_START_END_WRITE_FUNC3 (0x8F)
 
-#define KB900X_I2C_WRITE_BYTCNT 0x02
+#define KB900X_I2C_WRITE_BYTCNT (0x02)
 
-#define KB900X_SLAVE_ADDR 0x21
-#define KB900X_MUTEX_LOCK_MS 1000
+#define KB900X_SLAVE_ADDR (0x21)
+#define KB900X_MUTEX_LOCK_MS (1000)
 
-#define KB900X_B0_REVID 0x00000010
-#define KB900X_B1_REVID 0x00000011
+#define KB900X_B0_REVID (0x00000010)
+#define KB900X_B1_REVID (0x00000011)
 
-// Symbolic offsets for Zephyr's sensor_cfg->offset
-#define KB900X_CFG_OFFSET_TEMPERATURE 0x00
+// Symbolic offsets for Zephyr's sensor_cfg->offset (kb900x_read function)
+#define KB900X_CFG_OFFSET_TEMPERATURE (0x00)
 
 // SMBus command offsets
-#define KB900X_SMBUS_OFFSET_GLOB_PARAM_REG_1 0x0004
-#define KB900X_SMBUS_OFFSET_FW_VERSION 0x0500
-#define KB900X_SMBUS_OFFSET_TEMPERATURE 0x0510
+#define KB900X_SMBUS_OFFSET_GLOB_PARAM_REG_1 (0x0004)
+#define KB900X_SMBUS_OFFSET_FW_VERSION (0x0500)
+#define KB900X_SMBUS_OFFSET_TEMPERATURE (0x0510)
+#define KB900X_SMBUS_OFFSET_RTSSM_DUMP_REQ (0x05C4)
+#define KB900X_SMBUS_OFFSET_RTSSM_DUMP_REQ_STATUS (0x05C8)
+#define KB900X_SMBUS_OFFSET_RTSSM_DUMP_START_ADDR (0x05CC)
+#define KB900X_SMBUS_OFFSET_RTSSM_DUMP_LENGTH (0x05D0)
+#define KB900x_SMBUS_OFFSET_BIFURCATION_MODE_INFO (0x06C0)
+#define KB900X_SMBUS_OFFSET_LINK_STATUS_GATHER (0x0560)
+#define KB900X_SMBUS_OFFSET_LINK_STATUS_READY (0x0564)
+#define KB900X_SMBUS_OFFSET_LINK_STATUS (0x0568)
+#define KB900X_SMBUS_OFFSET_FW_HEALTH (0x05B0)
 
-#define KB900X_MAX_RETRY 3
-#define KB900X_REGISTER_VALUE_WIDTH 4
-#define KB900X_REGISTER_ADDRESS_WIDTH 4
+#define KB900X_MAX_RETRY (3)
+#define KB900X_REQ_MAX_RETRY (10)
+#define KB900X_REGISTER_VALUE_WIDTH (4)
+#define KB900X_REGISTER_ADDRESS_WIDTH (4)
 
 #define ABSOLUTE_ZER0 (-273.15)
 #define KB900X_FLOAT_PRECISION (16)
@@ -79,6 +89,7 @@ typedef enum {
 	KB900X_E_COMM = -9, /**< Communication error */
 	KB900X_E_FW_NOT_READY = -10, /**< Firmware not ready to switch to SMBus */
 	KB900X_E_FW_ERROR = -11, /**< Firmware error */
+	KB900X_E_INVALID_DATA = -12 /** Invalid data */
 } kb900x_error_t;
 
 // Type and struct to inject different read/write methods (SMBus, raw I2C, mocked for unit tests)
@@ -163,6 +174,16 @@ typedef enum {
 } kb900x_boot_entity_t;
 
 /**
+ * \brief REQ status return type.
+ */
+typedef enum {
+	KB900X_FEATURE_REQ_STATUS_NOT_SET = 0, /* status_not set */
+	KB900X_FEATURE_REQ_STATUS_SUCCESS, /* Request succeeded */
+	KB900X_FEATURE_REQ_STATUS_IN_PROGRESS, /* Request in progress */
+	KB900X_FEATURE_REQ_STATUS_FAILURE, /* Request failed */
+} kb900x_feature_req_status_t;
+
+/**
  * \brief This struct is used to hold the firmware health (get_firmware_health)
  */
 typedef union {
@@ -202,30 +223,96 @@ typedef struct {
 	uint32_t value;
 } kb900x_register_record_t;
 
+/********** HW RTSSM structures START **********/
+/**
+ * \brief This enum represents the different bifurcation settings.
+ */
+typedef enum kb900x_bifurcation_modes // bifurcation modes
+{ KB900X_BIFUR_MODE_x16 = 0x00, // 1 logger
+  KB900X_BIFUR_MODE_x0x0x8 = 0x01,
+  KB900X_BIFUR_MODE_x0x0x0x4 = 0x02,
+  KB900X_BIFUR_MODE_x8x8 = 0x03,
+  KB900X_BIFUR_MODE_x8x4x4 = 0x04,
+  KB900X_BIFUR_MODE_x4x4x8 = 0x05,
+  KB900X_BIFUR_MODE_x4x4x4x4 = 0x06,
+  KB900X_BIFUR_MODE_x2x2x2x2x2x2x2x2 = 0x07,
+  KB900X_BIFUR_MODE_x8x4x2x2 = 0x08,
+  KB900X_BIFUR_MODE_x8x2x2x4 = 0x09,
+  KB900X_BIFUR_MODE_x2x2x4x8 = 0x0A,
+  KB900X_BIFUR_MODE_x4x2x2x8 = 0x0B,
+  KB900X_BIFUR_MODE_x2x2x2x2x8 = 0x0C,
+  KB900X_BIFUR_MODE_x8x2x2x2x2 = 0x0D,
+  KB900X_BIFUR_MODE_x2x2x4x4x4 = 0x0E,
+  KB900X_BIFUR_MODE_x4x2x2x4x4 = 0x0F,
+  KB900X_BIFUR_MODE_x4x4x2x2x4 = 0x10,
+  KB900X_BIFUR_MODE_x4x4x4x2x2 = 0x11,
+  KB900X_BIFUR_MODE_x2x2x2x2x4x4 = 0x12,
+  KB900X_BIFUR_MODE_x2x2x4x2x2x4 = 0x13,
+  KB900X_BIFUR_MODE_x4x2x2x2x2x4 = 0x14,
+  KB900X_BIFUR_MODE_x2x2x4x4x2x2 = 0x15,
+  KB900X_BIFUR_MODE_x4x2x2x4x2x2 = 0x16,
+  KB900X_BIFUR_MODE_x4x4x2x2x2x2 = 0x17,
+  KB900X_BIFUR_MODE_x2x2x2x2x2x2x4 = 0x18,
+  KB900X_BIFUR_MODE_x2x2x2x2x4x2x2 = 0x19,
+  KB900X_BIFUR_MODE_x2x2x4x2x2x2x2 = 0x1A,
+  KB900X_BIFUR_MODE_x4x2x2x2x2x2x2 = 0x1B,
+  KB900X_BIFUR_MODE_x4x4 = 0x1C,
+  KB900X_BIFUR_MODE_x2x2x4 = 0x1D,
+  KB900X_BIFUR_MODE_x4x2x2 = 0x1E,
+  KB900X_BIFUR_MODE_x2x2x2x2 = 0x1F,
+  KB900X_BIFUR_MODE_x2x2 = 0x20,
+
+  // maximum number of modes
+  KB900X_BIFUR_MODE_COUNT,
+} kb900x_bifurcation_mode_t;
+
+/**
+ * \brief Type representing a single entry in a log.
+ */
+typedef uint16_t kb900x_rtssm_entry_t;
+
+/**
+ * \brief Struct representing all RTSSM entries of a single RPCS
+ */
+typedef struct {
+	uint32_t log_map_info;
+	kb900x_rtssm_entry_t entries[32];
+} kb900x_rtssm_log_t;
+
+/**
+ * \brief Struct representing all the RTSSM logs on a device
+ */
+typedef struct {
+	uint8_t nb_loggers; // number of loggers
+	kb900x_rtssm_log_t logs[8]; // indexed log contents (some may be empty)
+} kb900x_rtssm_all_logs_t;
+
+/********** HW RTSSM structures END **********/
+
 /************** I2C MASTER SECTION START **************/
 
 #define KB900X_TX_FIFO_DEPTH (24)
 #define KB900X_RX_FIFO_DEPTH (24)
 
 // I2C Master interface registers
-#define kb900x_ee_IC_CON 0xe0081000
-#define kb900x_ee_IC_TAR 0xe0081004
-#define kb900x_ee_IC_DATA_CMD 0xe0081010
-#define kb900x_ee_IC_INTR_MASK 0xe0081030
-#define kb900x_ee_IC_RAW_INTR_STAT 0xe0081034
-#define kb900x_ee_IC_ENABLE 0xe008106c
-#define kb900x_ee_IC_STATUS 0xe0081070
-#define kb900x_ee_IC_TX_ABRT_SOURCE 0xe0081080
-#define kb900x_cfg_top_vd_bump_0 0xe048018c
-#define kb900x_cfg_top_vd_bump_1 0xe0480190
+#define kb900x_ee_IC_CON (0xe0081000)
+#define kb900x_ee_IC_TAR (0xe0081004)
+#define kb900x_ee_IC_DATA_CMD (0xe0081010)
+#define kb900x_ee_IC_INTR_MASK (0xe0081030)
+#define kb900x_ee_IC_RAW_INTR_STAT (0xe0081034)
+#define kb900x_ee_IC_ENABLE (0xe008106c)
+#define kb900x_ee_IC_STATUS (0xe0081070)
+#define kb900x_ee_IC_TX_ABRT_SOURCE (0xe0081080)
+#define kb900x_cfg_top_vd_bump_0 (0xe048018c)
+#define kb900x_cfg_top_vd_bump_1 (0xe0480190)
 
 // Other registers
 #define kb900x_cpu_periph_clk_gate_en                                                              \
-	0xe009005c // I2C Master clock - Clock gate enables per peripheral
-#define kb900x_cpu_system 0xe0090008
-#define kb900x_tx_abrt_clr 0xe0081054 // Clear interrupts
-#define kb900x_cfg_top_revid 0xe0480004
-#define kb900x_smbus_mux 0xe0480008
+	(0xe009005c) // I2C Master clock - Clock gate enables per peripheral
+#define kb900x_cpu_system (0xe0090008)
+#define kb900x_tx_abrt_clr (0xe0081054) // Clear interrupts
+#define kb900x_cfg_top_revid (0xe0480004)
+#define kb900x_smbus_mux (0xe0480008)
 
 // Global variable to store the selected slave address
 extern uint8_t kb900x_eeprom_slave_addr;
@@ -235,7 +322,7 @@ extern uint8_t kb900x_eeprom_slave_addr;
 /**
  * \brief Get the communication mode used by the SDK.
  *
- * \param[in] msg I2C_MSG structure to communicate with KB900X,
+ * \param[in] msg I2C_MSG structure to communicate with KB900X.
  *                `msg->target_addr` and `msg->bus` must be set by the caller to point to KB900X
  * \param[out] mode a pointer to write the communication mode to
  *
@@ -248,7 +335,7 @@ kb900x_error_t kb900x_get_connection_mode(kb900x_communication_mode_t *mode);
  * This function detects the connection mode of the retimer and set it.
  * First trying with SMBus - If wrong PEC then raw I2C.
  *
- * \param[in] msg I2C_MSG structure to communicate with KB900X,
+ * \param[in] msg I2C_MSG structure to communicate with KB900X.
  *                `msg->target_addr` and `msg->bus` must be set by the caller to point to KB900X
  * \param[out] mode the communication mode
  *
@@ -260,7 +347,7 @@ kb900x_error_t kb900x_detect_connection_mode(I2C_MSG *msg, kb900x_communication_
  *
  * \note This feature interract with the firmware to enable the SMBus connection mode.
  *
- * \param[in] msg I2C_MSG structure to communicate with KB900X,
+ * \param[in] msg I2C_MSG structure to communicate with KB900X.
  *                `msg->target_addr` and `msg->bus` must be set by the caller to point to KB900X
  *
  * \return error code, KB900X_E_OK if successful, otherwise an other error code
@@ -271,7 +358,7 @@ kb900x_error_t kb900x_enable_smbus(I2C_MSG *msg);
  *
  * \note This feature interract with the firmware to enable the SMBus connection mode.
  *
- * \param[in] msg I2C_MSG structure to communicate with KB900X,
+ * \param[in] msg I2C_MSG structure to communicate with KB900X.
  *                `msg->target_addr` and `msg->bus` must be set by the caller to point to KB900X
  *
  * \return error code, KB900X_E_OK if successful, otherwise an other error code
@@ -285,7 +372,7 @@ kb900x_error_t kb900x_init_smbus(I2C_MSG *msg);
 /**
  * \brief Initialize the KB900X I2C master interface
  *
- * \param[in] msg I2C_MSG structure to communicate with KB900X,
+ * \param[in] msg I2C_MSG structure to communicate with KB900X.
  *                `msg->target_addr` and `msg->bus` must be set by the caller to point to KB900X
  * \param[in] slave_addr the default I2C slave address KB900X's I2C master interface should communicate with
  *
@@ -300,7 +387,7 @@ kb900x_error_t kb900x_i2c_master_init(I2C_MSG *msg, uint8_t slave_addr);
 /**
  * \brief Read from the KB900X EEPROM.
  *
- * \param[in] msg I2C_MSG structure to communicate with KB900X,
+ * \param[in] msg I2C_MSG structure to communicate with KB900X.
  *                `msg->target_addr` and `msg->bus` must be set by the caller to point to KB900X
  * \param[in] addr the EEPROM address to start reading from
  * \param[in] length the number of bytes to read
@@ -314,7 +401,7 @@ kb900x_error_t kb900x_read_firmware(I2C_MSG *msg, uint32_t addr, size_t length, 
 
 /** \brief Compare the content of the EEPROM with expected data.
  *
- * \param[in] msg I2C_MSG structure to communicate with KB900X,
+ * \param[in] msg I2C_MSG structure to communicate with KB900X.
  *                `msg->target_addr` and `msg->bus` must be set by the caller to point to KB900X
  * \param[in] offset the offset in the EEPROM to start reading from
  * \param[in] buffer the buffer containing the expected firmware, starting at `offset` offset in the EEPROM
@@ -328,7 +415,7 @@ kb900x_error_t kb900x_check_firmware(I2C_MSG *msg, uint32_t offset, uint8_t *buf
 
 /** \brief Flash the firmware.
  *
- * \param[in] msg I2C_MSG structure to communicate with KB900X,
+ * \param[in] msg I2C_MSG structure to communicate with KB900X.
  *                `msg->target_addr` and `msg->bus` must be set by the caller to point to KB900X
  * \param[in] addr the EEPROM address to start writing to
  * \param[in] payload the data to write
@@ -343,7 +430,7 @@ kb900x_error_t kb900x_flash_firmware(I2C_MSG *msg, uint32_t addr, uint8_t *paylo
 /**
  * \brief Write the KB900X firmware to the KB900X firmware EEPROM.
  *
- * \param[in] msg I2C_MSG structure to communicate with KB900X,
+ * \param[in] msg I2C_MSG structure to communicate with KB900X.
  *                `msg->target_addr` and `msg->bus` must be set by the caller to point to KB900X
  * \param[in] offset the offset in the EEPROM to start writing to
  * \param[in] msg_len the length of the data to write
@@ -352,7 +439,7 @@ kb900x_error_t kb900x_flash_firmware(I2C_MSG *msg, uint32_t addr, uint8_t *paylo
  *
  * \return 0 if no error, else the error code
  */
-uint8_t kb900x_pcie_retimer_fw_update(I2C_MSG *msg, uint32_t offset, uint16_t msg_len,
+uint8_t kb900x_pcie_retimer_fw_update(I2C_MSG *msg, uint32_t offset, uint32_t msg_len,
 				      uint8_t *msg_buf, uint8_t flag);
 
 /************** KB900X EEPROM READ/WRITE SECTION END **************/
@@ -362,7 +449,7 @@ uint8_t kb900x_pcie_retimer_fw_update(I2C_MSG *msg, uint32_t offset, uint16_t ms
 /**
  * \brief Get the KB900X vendor ID.
  *
- * \param[in] msg I2C_MSG structure to communicate with KB900X,
+ * \param[in] msg I2C_MSG structure to communicate with KB900X.
  *               `msg->target_addr` and `msg->bus` must be set by the caller to point to KB900X
  * \param[out] vendor_id a pointer to the integer used to store the vendor ID
  *
@@ -373,7 +460,7 @@ bool kb900x_get_vendor_id(I2C_MSG *msg, int *vendor_id);
 /**
  * \brief Get the KB900X temperature.
  *
- * \param[in] msg I2C_MSG structure to communicate with KB900X,
+ * \param[in] msg I2C_MSG structure to communicate with KB900X.
  *               `msg->target_addr` and `msg->bus` must be set by the caller to point to KB900X
  * \param[out] temperature a pointer to the float used to store the temperature
  *
@@ -390,7 +477,7 @@ kb900x_error_t kb900x_get_temperature(I2C_MSG *msg, float *temperature);
  * The port parameter is used to select from which side of the retimer to get
  * the temperature from (0 = upstream, 1 = downstream).
  *
- * \param[in] msg I2C_MSG structure to communicate with KB900X,
+ * \param[in] msg I2C_MSG structure to communicate with KB900X.
  *               `msg->target_addr` and `msg->bus` must be set by the caller to point to KB900X
  * \param[in] port the port, 0 = A (upstream), anything else = B (downstream)
  * \param[in] lane the lane id, 0 to 15
@@ -403,7 +490,7 @@ kb900x_error_t kb900x_get_lane_temperature(I2C_MSG *msg, int port, int lane, flo
 /**
  * \brief Get the KB900X firmware version.
  *
- * \param[in] msg I2C_MSG structure to communicate with KB900X,
+ * \param[in] msg I2C_MSG structure to communicate with KB900X.
  *               `msg->target_addr` and `msg->bus` must be set by the caller to point to KB900X
  * \param[out] version a pointer to the uint8_t array used to store the firmware version;
  *              the array must be at least 4 bytes long
@@ -412,9 +499,19 @@ kb900x_error_t kb900x_get_lane_temperature(I2C_MSG *msg, int port, int lane, flo
  */
 bool kb900x_get_fw_version(I2C_MSG *msg, uint8_t *version);
 
+/** \brief Dump the RTSSM data area into a buffer.
+ *
+ * \param[in] msg I2C_MSG structure to communicate with KB900X.
+ *               `msg->target_addr` and `msg->bus` must be set by the caller to point to KB900X
+ * \param[out] logs a pointer to the HW RTSSM logs
+ *
+ * \return error code, KB900X_E_OK if successful, otherwise an other error code
+ */
+kb900x_error_t kb900x_get_hw_rtssm_logs(I2C_MSG *msg, kb900x_rtssm_all_logs_t *logs);
+
 /** \brief Get the firmware health.
  *
- * \param[in] msg I2C_MSG structure to communicate with KB900X,
+ * \param[in] msg I2C_MSG structure to communicate with KB900X.
  *               `msg->target_addr` and `msg->bus` must be set by the caller to point to KB900X
  * \param[out] firmware_health pointer to the firmware health
  *
@@ -422,21 +519,9 @@ bool kb900x_get_fw_version(I2C_MSG *msg, uint8_t *version);
  */
 kb900x_error_t kb900x_get_firmware_health(I2C_MSG *msg, kb900x_fw_health_t *firmware_health);
 
-/** \brief Dump the RTSSM data area into a buffer.
- *
- * \note Only in SMBUS mode.
- *
- * \param[in] msg I2C_MSG structure to communicate with KB900X,
- *               `msg->target_addr` and `msg->bus` must be set by the caller to point to KB900X
- * \param[out] buffer a pointer to a u32 buffer of size >= (SIZEOF_SW_SHARED_DATA / 4)
- *
- * \return error code, KB900X_E_OK if successful, otherwise an other error code
- */
-kb900x_error_t kb900x_get_rtssm_dump(I2C_MSG *msg, uint32_t *buffer);
-
 /** \brief Get the status of a given link.
  *
- * \param[in] msg I2C_MSG structure to communicate with KB900X,
+ * \param[in] msg I2C_MSG structure to communicate with KB900X.
  *               `msg->target_addr` and `msg->bus` must be set by the caller to point to KB900X
  * \param[in] link_id the link id (0-7)
  * \param[out] link_status pointer to the lane status
@@ -455,7 +540,7 @@ kb900x_error_t kb900x_get_link_status(I2C_MSG *msg, int link_id, kb900x_link_sta
  *
  * \note As the boot sequence takes up to 2 seconds to complete, it is recommended to wait at least 2 seconds before interracting with KB900x again.
  *
- * \param[in] msg I2C_MSG structure to communicate with KB900X,
+ * \param[in] msg I2C_MSG structure to communicate with KB900X.
  *               `msg->target_addr` and `msg->bus` must be set by the caller to point to KB900X
  *
  * \return error code, KB900X_E_OK if successful, otherwise an other error code
@@ -467,7 +552,7 @@ kb900x_error_t kb900x_reset(I2C_MSG *msg);
  *
  * This function gets and check the boot status of the KB900x firmware.
  *
- * \param[in] msg I2C_MSG structure to communicate with KB900X,
+ * \param[in] msg I2C_MSG structure to communicate with KB900X.
  *               `msg->target_addr` and `msg->bus` must be set by the caller to point to KB900X
  * \param[out] is_ready true if firmware ready to switch to SMBus otherwise false
  *
@@ -476,11 +561,23 @@ kb900x_error_t kb900x_reset(I2C_MSG *msg);
 kb900x_error_t kb900x_is_firmware_ready(I2C_MSG *msg, bool *is_ready);
 
 /**
+ * \brief Get firmware health informations.
+ *
+ * \param[in] msg I2C_MSG structure to communicate with KB900X.
+ *               `msg->target_addr` and `msg->bus` must be set by the caller to point to KB900X
+ * 
+ * \param[out] firmware_health pointer to the firmware health structure
+ *
+ * \return error code, E_OK if successful, otherwise an other error code
+ */
+kb900x_error_t kb900x_get_firmware_health(I2C_MSG *msg, kb900x_fw_health_t *firmware_health);
+
+/**
  * \brief Get the boot status of KB900x firmware.
  *
  * This function gets and check the boot status of the KB900x firmware.
  *
- * \param[in] msg I2C_MSG structure to communicate with KB900X,
+ * \param[in] msg I2C_MSG structure to communicate with KB900X.
  *               `msg->target_addr` and `msg->bus` must be set by the caller to point to KB900X
  * \param[out] entity contains the boot entity
  * \param[out] status contains the boot status of the entity
@@ -490,10 +587,23 @@ kb900x_error_t kb900x_is_firmware_ready(I2C_MSG *msg, bool *is_ready);
 kb900x_error_t kb900x_get_boot_status(I2C_MSG *msg, kb900x_boot_entity_t *entity,
 				      kb900x_boot_status_t *status);
 
+/** 
+ * \brief Get the link status for a given link id.
+ * 
+ * \param[in] msg I2C_MSG structure to communicate with KB900X.
+ *               `msg->target_addr` and `msg->bus` must be set by the caller to point to KB900X
+ * \param[in] link_id the link id, kb900x_get_max_nb_links() can be used to get the maximum number of links
+ * 
+ * \param[out] link_status a pointer to the link status structure
+ * 
+ * \return error code, KB900X_E_OK if successful, otherwise an other error code
+ */
+kb900x_error_t kb900x_get_link_status(I2C_MSG *msg, int link_id, kb900x_link_status_t *link_status);
+
 /**
  * \brief Read and return the rev ID of the KB900x chip.
  *
- * \param[in] msg I2C_MSG structure to communicate with KB900X,
+ * \param[in] msg I2C_MSG structure to communicate with KB900X.
  *               `msg->target_addr` and `msg->bus` must be set by the caller to point to KB900X
  * \param[out] revid a pointer for writing the result
  *
@@ -504,7 +614,7 @@ kb900x_error_t kb900x_get_revid(I2C_MSG *msg, uint32_t *revid);
 /**
  * \brief Compute the SDS address based on the KB900x chip revid.
  *
- * \param[in] msg I2C_MSG structure to communicate with KB900X,
+ * \param[in] msg I2C_MSG structure to communicate with KB900X.
  *               `msg->target_addr` and `msg->bus` must be set by the caller to point to KB900X
  * \param[out] sds_addr a pointer for writing the result
  *
@@ -519,7 +629,7 @@ kb900x_error_t kb900x_get_sds_addr(I2C_MSG *msg, uint32_t *sds_addr);
  * \note Use this to dump all PHY/RPCS registers in several steps. Useful if
  *       if you cannot allocate enough memory for a complete register dump.
  *
- * \param[in] msg I2C_MSG structure to communicate with KB900X,
+ * \param[in] msg I2C_MSG structure to communicate with KB900X.
  *               `msg->target_addr` and `msg->bus` must be set by the caller to point to KB900X
  * \param[out] records a non-NULL pointer where to write the dump records,
  *                     should point to a buffer large enough to hold the number
@@ -542,11 +652,11 @@ typedef struct _kb900x_init_arg_ {
 /**
  * \brief Generic read function.
  *
- * \param[in] cfg a pointer to the sensor_cfg structure that has to contain 
+ * \param[in] cfg a pointer to the sensor_cfg structure that has to contain
  *      the I2C port, the I2C slave address and the offset that represents the
  *      information to read.
  * \param[out] reading a pointer to the integer (32 bits) used to store the data read
- * 
+ *
  * \return error code, KB900X_E_OK if successful, otherwise an other error code
  */
 uint8_t kb900x_read(sensor_cfg *cfg, int *reading);
@@ -554,9 +664,9 @@ uint8_t kb900x_read(sensor_cfg *cfg, int *reading);
 /**
  * \brief Initialize the KB900X driver.
  *
- * \param[in] cfg a pointer to the sensor_cfg structure that has to contain 
+ * \param[in] cfg a pointer to the sensor_cfg structure that has to contain
  *      the I2C port and the I2C slave address
- * 
+ *
  * \return error code, KB900X_E_OK if successful, otherwise an other error code
  */
 uint8_t kb900x_init(sensor_cfg *cfg);
