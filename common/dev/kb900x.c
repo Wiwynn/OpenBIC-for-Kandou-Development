@@ -425,7 +425,7 @@ kb900x_error_t kb900x_get_max_nb_links(I2C_MSG *msg, uint8_t *max_nb_links)
 		[KB900X_BIFUR_MODE_x2x2] = 2,
 	};
 	// Get the bifurcation
-	kb900x_error_t ret = smbus_read_command(msg, KB900x_SMBUS_OFFSET_BIFURCATION_MODE_INFO);
+	kb900x_error_t ret = smbus_read_command(msg, KB900X_SMBUS_OFFSET_BIFURCATION_MODE_INFO);
 	if (ret != KB900X_E_OK) {
 		LOG_ERR("Failed to get bifurcation setting from firmware config with error code: %d",
 			ret);
