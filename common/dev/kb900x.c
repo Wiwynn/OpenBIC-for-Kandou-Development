@@ -1,5 +1,5 @@
 /*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * Copyright (c) Kandou-AI.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -54,6 +54,33 @@ K_MUTEX_DEFINE(kb900x_mutex);
 			 (msg->data[bytecnt - 1] << 16) + (msg->data[bytecnt] << 24));             \
 	} while (0)
 
+// DO NOT MODIFY - this is set by kb900x_init
+uint8_t _version[4] = { 0, 0, 0, 0 };
+// Set to true to skip the version check
+bool _skip_fw_version_check = true;
+
+#define KB900X_ENSURE_MINIMAL_FW_VERSION(min_major, min_minor, min_incr)                           \
+	do {                                                                                       \
+		if (!_skip_fw_version_check) {                                                     \
+			kb900x_communication_mode_t mode;                                          \
+			kb900x_error_t ret = kb900x_get_communication_mode(&mode);                 \
+			if (ret != KB900X_E_OK) {                                                  \
+				return ret;                                                        \
+			}                                                                          \
+			if (mode == KB900X_COMM_SMBUS) {                                           \
+				uint8_t min_version[] = { (min_major), (min_minor), (min_incr) };  \
+				bool is_version_ok;                                                \
+				ret = _check_fw_version(_version, min_version, &is_version_ok);    \
+				if (ret != KB900X_E_OK) {                                          \
+					return ret;                                                \
+				}                                                                  \
+				if (!is_version_ok) {                                              \
+					return KB900X_E_OP_NOT_SUPPPORTED_FW;                      \
+				}                                                                  \
+			}                                                                          \
+		}                                                                                  \
+	} while (0)
+
 kb900x_error_t kb900x_write_register(I2C_MSG *msg, uint32_t address, uint32_t value);
 kb900x_error_t kb900x_read_register(I2C_MSG *msg, uint32_t address, uint32_t *value);
 kb900x_error_t kb900x_write_field(I2C_MSG *msg, uint32_t addr, uint8_t field_width,
@@ -69,12 +96,33 @@ KB900X_REGISTER_IO kb900x_register_io = {
 	.read = twi_read_register,
 };
 
+const uint8_t KB900X_VENDOR_ID[KB900X_VENDOR_ID_LENGTH] = {
+	0x06, 0x04, 0x00, 0x00, 0x00, 0x6F, 0x1E
+};
+
+/**
+ * \brief Calculate the CRC8 PEC
+ *
+ * This function calculates the CRC8 PEC checksum for a given data array.
+ * \param[in] data Pointer to the data array for which the CRC8 PEC is calculated.
+ * \param[in] len The length of the data array.
+ * \return The calculated CRC8 PEC value.
+ */
 static uint8_t cal_crc8_pec(uint8_t *data, uint8_t len)
 {
 	CHECK_NULL_ARG_WITH_RETURN(data, KB900X_E_INVALID_ARG);
 	return crc8(data, len, 0x07, 0x00, false);
 }
 
+/**
+ * \brief Check the CRC8 PEC (Parity Error Code)
+ *
+ * \param[in] msg I2C_MSG structure to communicate with KB900X,
+ *               `msg->target_addr` and `msg->bus` must be set by the caller to point to KB900X
+ * \param[in] command_code the command code to check
+ *
+ * \return true if the CRC is valid, false otherwise.
+ */
 static bool verify_crc8_pec(I2C_MSG *msg, uint8_t command_code)
 {
 	CHECK_NULL_ARG_WITH_RETURN(msg, false);
@@ -99,116 +147,8 @@ static bool verify_crc8_pec(I2C_MSG *msg, uint8_t command_code)
 	return true;
 }
 
-kb900x_error_t smbus_read_command(I2C_MSG *msg, uint16_t offsets)
-{
-	CHECK_NULL_ARG_WITH_RETURN(msg, KB900X_E_INVALID_ARG);
-
-	kb900x_error_t ret = KB900X_E_OK;
-
-	KB900X_LOCK_MUTEX(kb900x_mutex, KB900X_E_MUX_LOCK_FAILED);
-	uint8_t retry = 0;
-	do {
-		retry++;
-		msg->data[0] = KB900X_CCODE_START_READ_FUNC0; // COMMAND CODE
-		msg->data[1] = KB900X_I2C_WRITE_BYTCNT; // byte count
-		msg->data[2] = (uint8_t)(offsets & 0xFF); // lower offset
-		msg->data[3] = (uint8_t)(offsets >> 8); // upper offset
-		msg->tx_len = 5;
-
-		// PEC signature
-		uint8_t crc_list[msg->tx_len];
-		crc_list[0] = msg->target_addr << 1;
-		memcpy(&(crc_list[1]), msg->data, msg->tx_len - 1);
-		msg->data[msg->tx_len - 1] = cal_crc8_pec(crc_list, msg->tx_len);
-
-		// Write (Prepare read)
-		if (i2c_master_write(msg, KB900X_MAX_RETRY)) {
-			LOG_ERR("Failed to write, 0x%X not set", offsets);
-			ret = KB900X_E_I2C_ERROR;
-			goto exit;
-		}
-
-		// Read
-		memset(msg->data, 0, I2C_BUFF_SIZE);
-		msg->tx_len = 1;
-		msg->rx_len = 8;
-		msg->data[0] = KB900X_CCODE_END_READ_FUNC0;
-		if (i2c_master_read(msg, KB900X_MAX_RETRY)) {
-			LOG_ERR("Failed to read PCIE RETIMER addr 0x%X", offsets);
-			ret = KB900X_E_I2C_ERROR;
-			goto exit;
-		}
-	} while (retry < KB900X_MAX_RETRY && !verify_crc8_pec(msg, KB900X_CCODE_END_READ_FUNC0));
-
-	// PEC validation
-	if (!verify_crc8_pec(msg, KB900X_CCODE_END_READ_FUNC0)) {
-		ret = KB900X_E_CRC_ERROR;
-		goto exit;
-	}
-
-exit:
-	KB900X_UNLOCK_MUTEX(kb900x_mutex, KB900X_E_MUX_UNLOCK_FAILED);
-	return ret;
-}
-
 /**
- * \brief Read a 32-bit register from KB900X using TWI
- *
- * \param[in] msg I2C_MSG structure to communicate with KB900X,
- *                `msg->target_addr` and `msg->bus` must be set by the caller to point to KB900X
- * \param[in] address the address of the register to read
- * \param[out] value a pointer to the uint32_t used to store the result
- *
- * \return error code, KB900X_E_OK if successful, otherwise an other error code
- */
-kb900x_error_t twi_read_register(I2C_MSG *msg, uint32_t address, uint32_t *value)
-{
-	CHECK_NULL_ARG_WITH_RETURN(value, KB900X_E_INVALID_ARG);
-	CHECK_NULL_ARG_WITH_RETURN(msg, KB900X_E_INVALID_ARG);
-
-	kb900x_error_t ret = KB900X_E_OK;
-
-	KB900X_LOCK_MUTEX(kb900x_mutex, KB900X_E_MUX_LOCK_FAILED);
-
-	// As we don't care about the APB and tile number (only accessing tile0)
-	const uint32_t mask = 0x0CFFFFFF;
-	address = address & mask;
-
-	for (int i = 0; i < KB900X_REGISTER_ADDRESS_WIDTH; i++) {
-		msg->data[i] =
-			(uint8_t)((address >> (KB900X_REGISTER_ADDRESS_WIDTH - i - 1) * 8) & 0xFF);
-	}
-	msg->tx_len = KB900X_REGISTER_ADDRESS_WIDTH;
-
-	// Write (Prepare read)
-	if (i2c_master_write(msg, KB900X_MAX_RETRY)) {
-		LOG_ERR("Failed to write, 0x%X not set", address);
-		ret = KB900X_E_I2C_ERROR;
-		goto exit;
-	}
-
-	// Read
-	memset(msg->data, 0, I2C_BUFF_SIZE);
-	msg->tx_len = 0;
-	msg->rx_len = KB900X_REGISTER_VALUE_WIDTH;
-	if (i2c_master_read(msg, KB900X_MAX_RETRY)) {
-		LOG_ERR("Failed to read PCIE RETIMER addr 0x%X", address);
-		ret = KB900X_E_I2C_ERROR;
-		goto exit;
-	}
-
-	*value = 0;
-	for (int i = 0; i < KB900X_REGISTER_VALUE_WIDTH; i++) {
-		*value |= ((msg->data[i]) << (((KB900X_REGISTER_VALUE_WIDTH - i) - 1) * 8));
-	}
-
-exit:
-	KB900X_UNLOCK_MUTEX(kb900x_mutex, KB900X_E_MUX_UNLOCK_FAILED);
-	return ret;
-}
-
-/**
- * \brief Write a 32-bit register to KB900X using TWI
+ * \brief Write a 32-bit register to KB900X using SMBus
  *
  * \param[in] msg I2C_MSG structure to communicate with KB900X,
  *                `msg->target_addr` and `msg->bus` must be set by the caller to point to KB900X
@@ -217,7 +157,7 @@ exit:
  *
  * \return error code, KB900X_E_OK if successful, otherwise an other error code
  */
-kb900x_error_t twi_write_register(I2C_MSG *msg, uint32_t address, uint32_t value)
+static kb900x_error_t smbus_write_register(I2C_MSG *msg, const uint32_t address, uint32_t value)
 {
 	CHECK_NULL_ARG_WITH_RETURN(msg, KB900X_E_INVALID_ARG);
 
@@ -225,19 +165,26 @@ kb900x_error_t twi_write_register(I2C_MSG *msg, uint32_t address, uint32_t value
 
 	KB900X_LOCK_MUTEX(kb900x_mutex, KB900X_E_MUX_LOCK_FAILED);
 
-	// As we don't care about the APB and tile number (only accessing tile0)
-	const uint32_t mask = 0x0CFFFFFF;
-	address = address & mask;
-
+	uint8_t payload_offset = 0;
+	// Command code
+	msg->data[payload_offset++] = KB900X_CCODE_START_END_WRITE_FUNC3;
+	// Bytecnt
+	msg->data[payload_offset++] = KB900X_REGISTER_VALUE_WIDTH + KB900X_REGISTER_ADDRESS_WIDTH;
 	for (int i = 0; i < KB900X_REGISTER_ADDRESS_WIDTH; i++) {
-		msg->data[i] =
-			(uint8_t)((address >> (KB900X_REGISTER_ADDRESS_WIDTH - i - 1) * 8) & 0xFF);
+		msg->data[payload_offset + i] = (address >> (i * 8)) & 0xFF;
 	}
+	payload_offset += KB900X_REGISTER_ADDRESS_WIDTH;
 	for (int i = 0; i < KB900X_REGISTER_VALUE_WIDTH; i++) {
-		msg->data[i + KB900X_REGISTER_ADDRESS_WIDTH] =
-			(uint8_t)((value >> (KB900X_REGISTER_ADDRESS_WIDTH - i - 1) * 8) & 0xFF);
+		msg->data[payload_offset + i] = (value >> (i * 8)) & 0xFF;
 	}
-	msg->tx_len = KB900X_REGISTER_ADDRESS_WIDTH + KB900X_REGISTER_VALUE_WIDTH;
+	payload_offset += KB900X_REGISTER_VALUE_WIDTH;
+	msg->tx_len = payload_offset + 1; // + PEC
+
+	// PEC signature
+	uint8_t crc_list[msg->tx_len];
+	crc_list[0] = msg->target_addr << 1;
+	memcpy(&(crc_list[1]), msg->data, msg->tx_len - 1);
+	msg->data[msg->tx_len - 1] = cal_crc8_pec(crc_list, msg->tx_len);
 
 	// Write
 	if (i2c_master_write(msg, KB900X_MAX_RETRY)) {
@@ -261,7 +208,7 @@ exit:
  *
  * \return error code, KB900X_E_OK if successful, otherwise an other error code
  */
-kb900x_error_t smbus_read_register(I2C_MSG *msg, const uint32_t address, uint32_t *value)
+static kb900x_error_t smbus_read_register(I2C_MSG *msg, const uint32_t address, uint32_t *value)
 {
 	CHECK_NULL_ARG_WITH_RETURN(value, KB900X_E_INVALID_ARG);
 	CHECK_NULL_ARG_WITH_RETURN(msg, KB900X_E_INVALID_ARG);
@@ -327,7 +274,7 @@ exit:
 }
 
 /**
- * \brief Write a 32-bit register to KB900X using SMBus
+ * \brief Write a 32-bit register to KB900X using TWI
  *
  * \param[in] msg I2C_MSG structure to communicate with KB900X,
  *                `msg->target_addr` and `msg->bus` must be set by the caller to point to KB900X
@@ -336,7 +283,7 @@ exit:
  *
  * \return error code, KB900X_E_OK if successful, otherwise an other error code
  */
-kb900x_error_t smbus_write_register(I2C_MSG *msg, const uint32_t address, uint32_t value)
+kb900x_error_t twi_write_register(I2C_MSG *msg, uint32_t address, uint32_t value)
 {
 	CHECK_NULL_ARG_WITH_RETURN(msg, KB900X_E_INVALID_ARG);
 
@@ -344,26 +291,19 @@ kb900x_error_t smbus_write_register(I2C_MSG *msg, const uint32_t address, uint32
 
 	KB900X_LOCK_MUTEX(kb900x_mutex, KB900X_E_MUX_LOCK_FAILED);
 
-	uint8_t payload_offset = 0;
-	// Command code
-	msg->data[payload_offset++] = KB900X_CCODE_START_END_WRITE_FUNC3;
-	// Bytecnt
-	msg->data[payload_offset++] = KB900X_REGISTER_VALUE_WIDTH + KB900X_REGISTER_ADDRESS_WIDTH;
-	for (int i = 0; i < KB900X_REGISTER_ADDRESS_WIDTH; i++) {
-		msg->data[payload_offset + i] = (address >> (i * 8)) & 0xFF;
-	}
-	payload_offset += KB900X_REGISTER_ADDRESS_WIDTH;
-	for (int i = 0; i < KB900X_REGISTER_VALUE_WIDTH; i++) {
-		msg->data[payload_offset + i] = (value >> (i * 8)) & 0xFF;
-	}
-	payload_offset += KB900X_REGISTER_VALUE_WIDTH;
-	msg->tx_len = payload_offset + 1; // + PEC
+	// As we don't care about the APB and tile number (only accessing tile0)
+	const uint32_t mask = 0x0CFFFFFF;
+	address = address & mask;
 
-	// PEC signature
-	uint8_t crc_list[msg->tx_len];
-	crc_list[0] = msg->target_addr << 1;
-	memcpy(&(crc_list[1]), msg->data, msg->tx_len - 1);
-	msg->data[msg->tx_len - 1] = cal_crc8_pec(crc_list, msg->tx_len);
+	for (int i = 0; i < KB900X_REGISTER_ADDRESS_WIDTH; i++) {
+		msg->data[i] =
+			(uint8_t)((address >> (KB900X_REGISTER_ADDRESS_WIDTH - i - 1) * 8) & 0xFF);
+	}
+	for (int i = 0; i < KB900X_REGISTER_VALUE_WIDTH; i++) {
+		msg->data[i + KB900X_REGISTER_ADDRESS_WIDTH] =
+			(uint8_t)((value >> (KB900X_REGISTER_ADDRESS_WIDTH - i - 1) * 8) & 0xFF);
+	}
+	msg->tx_len = KB900X_REGISTER_ADDRESS_WIDTH + KB900X_REGISTER_VALUE_WIDTH;
 
 	// Write
 	if (i2c_master_write(msg, KB900X_MAX_RETRY)) {
@@ -375,6 +315,217 @@ kb900x_error_t smbus_write_register(I2C_MSG *msg, const uint32_t address, uint32
 exit:
 	KB900X_UNLOCK_MUTEX(kb900x_mutex, KB900X_E_MUX_UNLOCK_FAILED);
 	return ret;
+}
+
+/**
+ * \brief Read a 32-bit register from KB900X using TWI
+ *
+ * \param[in] msg I2C_MSG structure to communicate with KB900X,
+ *                `msg->target_addr` and `msg->bus` must be set by the caller to point to KB900X
+ * \param[in] address the address of the register to read
+ * \param[out] value a pointer to the uint32_t used to store the result
+ *
+ * \return error code, KB900X_E_OK if successful, otherwise an other error code
+ */
+kb900x_error_t twi_read_register(I2C_MSG *msg, uint32_t address, uint32_t *value)
+{
+	CHECK_NULL_ARG_WITH_RETURN(value, KB900X_E_INVALID_ARG);
+	CHECK_NULL_ARG_WITH_RETURN(msg, KB900X_E_INVALID_ARG);
+
+	kb900x_error_t ret = KB900X_E_OK;
+
+	KB900X_LOCK_MUTEX(kb900x_mutex, KB900X_E_MUX_LOCK_FAILED);
+
+	// As we don't care about the APB and tile number (only accessing tile0)
+	const uint32_t mask = 0x0CFFFFFF;
+	address = address & mask;
+
+	for (int i = 0; i < KB900X_REGISTER_ADDRESS_WIDTH; i++) {
+		msg->data[i] =
+			(uint8_t)((address >> (KB900X_REGISTER_ADDRESS_WIDTH - i - 1) * 8) & 0xFF);
+	}
+	msg->tx_len = KB900X_REGISTER_ADDRESS_WIDTH;
+
+	// Write (Prepare read)
+	if (i2c_master_write(msg, KB900X_MAX_RETRY)) {
+		LOG_ERR("Failed to write, 0x%X not set", address);
+		ret = KB900X_E_I2C_ERROR;
+		goto exit;
+	}
+
+	// Read
+	memset(msg->data, 0, I2C_BUFF_SIZE);
+	msg->tx_len = 0;
+	msg->rx_len = KB900X_REGISTER_VALUE_WIDTH;
+	if (i2c_master_read(msg, KB900X_MAX_RETRY)) {
+		LOG_ERR("Failed to read PCIE RETIMER addr 0x%X", address);
+		ret = KB900X_E_I2C_ERROR;
+		goto exit;
+	}
+
+	*value = 0;
+	for (int i = 0; i < KB900X_REGISTER_VALUE_WIDTH; i++) {
+		*value |= ((msg->data[i]) << (((KB900X_REGISTER_VALUE_WIDTH - i) - 1) * 8));
+	}
+
+exit:
+	KB900X_UNLOCK_MUTEX(kb900x_mutex, KB900X_E_MUX_UNLOCK_FAILED);
+	return ret;
+}
+
+/**
+ * \brief Set the communication mode used by the driver.
+ *
+ * Can be either KB900X_COMM_SMBUS or KB900X_COMM_RAW_I2C.
+ *
+ * \param[in] msg I2C_MSG structure to communicate with KB900X,
+ *                `msg->target_addr` and `msg->bus` must be set by the caller to point to KB900X
+ * \param[in] mode the communication mode (KB900X_COMM_SMBUS = 0 or KB900X_COMM_RAW_I2C = 1)
+ *
+ * \return error code, KB900X_E_OK if successful, otherwise an other error code
+ */
+static kb900x_error_t kb900x_set_communication_mode(I2C_MSG *msg, kb900x_communication_mode_t mode)
+{
+	CHECK_NULL_ARG_WITH_RETURN(msg, KB900X_E_INVALID_ARG);
+	if (mode == KB900X_COMM_RAW_I2C) {
+		kb900x_register_io.write = twi_write_register;
+		kb900x_register_io.read = twi_read_register;
+	} else if (mode == KB900X_COMM_SMBUS) {
+		kb900x_register_io.write = smbus_write_register;
+		kb900x_register_io.read = smbus_read_register;
+	} else {
+		LOG_ERR("Invalid communication mode");
+		return KB900X_E_INVALID_ARG;
+	}
+	return KB900X_E_OK;
+}
+
+/**
+ * \brief Get the communication mode used by the driver.
+ *
+ * This function gets the currently configured communication mode of the driver. The mode can be either SMBus or I2C.
+ *
+ * \note This function does not read the actual retimer mode.
+ *
+ * \param[in] msg I2C_MSG structure to communicate with KB900X.
+ *                `msg->target_addr` and `msg->bus` must be set by the caller to point to KB900X
+ * \param[out] mode a pointer to write the communication mode to
+ *
+ * \return error code, KB900X_E_OK if successful, otherwise an other error code
+ */
+static kb900x_error_t kb900x_get_communication_mode(kb900x_communication_mode_t *mode)
+{
+	CHECK_NULL_ARG_WITH_RETURN(mode, KB900X_E_INVALID_ARG);
+
+	if (kb900x_register_io.write == twi_write_register &&
+	    kb900x_register_io.read == twi_read_register) {
+		*mode = KB900X_COMM_RAW_I2C;
+	} else if (kb900x_register_io.write == smbus_write_register &&
+		   kb900x_register_io.read == smbus_read_register) {
+		*mode = KB900X_COMM_SMBUS;
+	} else {
+		LOG_ERR("Corrupted communication mode");
+		return KB900X_E_INVALID_ARG;
+	}
+	return KB900X_E_OK;
+}
+
+void kb900x_skip_version_check(bool skip)
+{
+	_skip_fw_version_check = skip;
+}
+
+kb900x_error_t _check_fw_version(uint8_t *version, uint8_t *min_version, bool *is_version_ok)
+{
+	CHECK_NULL_ARG_WITH_RETURN(version, KB900X_E_INVALID_ARG);
+	CHECK_NULL_ARG_WITH_RETURN(min_version, KB900X_E_INVALID_ARG);
+	CHECK_NULL_ARG_WITH_RETURN(is_version_ok, KB900X_E_INVALID_ARG);
+
+	// Only check FW version in SMBUS mode
+	*is_version_ok = true;
+	for (size_t i = 0; i < 3; i++) {
+		if (version[i] < min_version[i]) {
+			*is_version_ok = false;
+			break;
+		} else if (version[i] > min_version[i]) {
+			*is_version_ok = true;
+			break;
+		}
+		// If these numbers are equal, check small numbers.
+		// If all numbers are equal, the minimal version is satisfied.
+	}
+
+	return KB900X_E_OK;
+}
+
+kb900x_error_t smbus_read_command(I2C_MSG *msg, uint16_t offsets)
+{
+	CHECK_NULL_ARG_WITH_RETURN(msg, KB900X_E_INVALID_ARG);
+
+	kb900x_error_t ret = KB900X_E_OK;
+
+	KB900X_LOCK_MUTEX(kb900x_mutex, KB900X_E_MUX_LOCK_FAILED);
+	uint8_t retry = 0;
+	do {
+		retry++;
+		msg->data[0] = KB900X_CCODE_START_READ_FUNC0; // COMMAND CODE
+		msg->data[1] = KB900X_I2C_WRITE_BYTCNT; // byte count
+		msg->data[2] = (uint8_t)(offsets & 0xFF); // lower offset
+		msg->data[3] = (uint8_t)(offsets >> 8); // upper offset
+		msg->tx_len = 5;
+
+		// PEC signature
+		uint8_t crc_list[msg->tx_len];
+		crc_list[0] = msg->target_addr << 1;
+		memcpy(&(crc_list[1]), msg->data, msg->tx_len - 1);
+		msg->data[msg->tx_len - 1] = cal_crc8_pec(crc_list, msg->tx_len);
+
+		// Write (Prepare read)
+		if (i2c_master_write(msg, KB900X_MAX_RETRY)) {
+			LOG_ERR("Failed to write, 0x%X not set", offsets);
+			ret = KB900X_E_I2C_ERROR;
+			goto exit;
+		}
+
+		// Read
+		memset(msg->data, 0, I2C_BUFF_SIZE);
+		msg->tx_len = 1;
+		msg->rx_len = 8;
+		msg->data[0] = KB900X_CCODE_END_READ_FUNC0;
+		if (i2c_master_read(msg, KB900X_MAX_RETRY)) {
+			LOG_ERR("Failed to read PCIE RETIMER addr 0x%X", offsets);
+			ret = KB900X_E_I2C_ERROR;
+			goto exit;
+		}
+	} while (retry < KB900X_MAX_RETRY && !verify_crc8_pec(msg, KB900X_CCODE_END_READ_FUNC0));
+
+	// PEC validation
+	if (!verify_crc8_pec(msg, KB900X_CCODE_END_READ_FUNC0)) {
+		ret = KB900X_E_CRC_ERROR;
+		goto exit;
+	}
+
+exit:
+	KB900X_UNLOCK_MUTEX(kb900x_mutex, KB900X_E_MUX_UNLOCK_FAILED);
+	return ret;
+}
+
+// This private function is not static so that it can be tested by automated tests
+kb900x_error_t _get_vendor_id(I2C_MSG *msg, int *vendor_id)
+{
+	CHECK_NULL_ARG_WITH_RETURN(msg, KB900X_E_INVALID_ARG);
+	CHECK_NULL_ARG_WITH_RETURN(vendor_id, KB900X_E_INVALID_ARG);
+	KB900X_ENSURE_MINIMAL_FW_VERSION(2, 0, 3);
+
+	const kb900x_error_t status = smbus_read_command(msg, KB900X_SMBUS_OFFSET_GLOB_PARAM_REG_1);
+	if (status == KB900X_E_OK) {
+		uint8_t bytecnt = msg->data[0];
+		*vendor_id = msg->data[bytecnt - 3] + (msg->data[bytecnt - 2] << 8) +
+			     (msg->data[bytecnt - 1] << 16) + (msg->data[bytecnt] << 24);
+	} else {
+		LOG_ERR("Failed to read vendor ID with error code: %d", status);
+	}
+	return KB900X_E_OK;
 }
 
 /**
@@ -469,18 +620,9 @@ kb900x_error_t kb900x_write_register(I2C_MSG *msg, uint32_t address, uint32_t va
 
 bool kb900x_get_vendor_id(I2C_MSG *msg, int *vendor_id)
 {
-	CHECK_NULL_ARG_WITH_RETURN(msg, KB900X_E_INVALID_ARG);
-	CHECK_NULL_ARG_WITH_RETURN(vendor_id, KB900X_E_INVALID_ARG);
-
-	const kb900x_error_t status = smbus_read_command(msg, KB900X_SMBUS_OFFSET_GLOB_PARAM_REG_1);
-	if (status == KB900X_E_OK) {
-		uint8_t bytecnt = msg->data[0];
-		*vendor_id = msg->data[bytecnt - 3] + (msg->data[bytecnt - 2] << 8) +
-			     (msg->data[bytecnt - 1] << 16) + (msg->data[bytecnt] << 24);
-	} else {
-		LOG_ERR("Failed to read vendor ID with error code: %d", status);
-	}
-	return (status == KB900X_E_OK);
+	// Convert return type to bool, use separate function with kb900x_error_t return type
+	// for testability
+	return _get_vendor_id(msg, vendor_id) == KB900X_E_OK;
 }
 
 bool kb900x_get_fw_version(I2C_MSG *msg, uint8_t *version)
@@ -502,10 +644,11 @@ bool kb900x_get_fw_version(I2C_MSG *msg, uint8_t *version)
 	return (status == KB900X_E_OK);
 }
 
-kb900x_error_t kb900x_get_hw_rtssm_logs(I2C_MSG *msg, kb900x_rtssm_all_logs_t *logs)
+kb900x_error_t kb900x_get_hw_rtssm_logs(I2C_MSG *msg, kb900x_hw_rtssm_logs_t *logs)
 {
 	CHECK_NULL_ARG_WITH_RETURN(msg, KB900X_E_INVALID_ARG);
 	CHECK_NULL_ARG_WITH_RETURN(logs, KB900X_E_INVALID_ARG);
+	KB900X_ENSURE_MINIMAL_FW_VERSION(2, 0, 5);
 
 	// Ask to prepare data
 	kb900x_error_t ret = smbus_read_command(msg, KB900X_SMBUS_OFFSET_RTSSM_DUMP_REQ);
@@ -517,6 +660,8 @@ kb900x_error_t kb900x_get_hw_rtssm_logs(I2C_MSG *msg, kb900x_rtssm_all_logs_t *l
 	uint8_t nb_try = KB900X_REQ_MAX_RETRY;
 	kb900x_feature_req_status_t status = KB900X_FEATURE_REQ_STATUS_IN_PROGRESS;
 	while (nb_try > 0 && status == KB900X_FEATURE_REQ_STATUS_IN_PROGRESS) {
+		k_sleep(K_MSEC(KB900X_REQ_STATUS_DELAY_MS));
+
 		ret = smbus_read_command(msg, KB900X_SMBUS_OFFSET_RTSSM_DUMP_REQ_STATUS);
 		if (ret != KB900X_E_OK) {
 			LOG_ERR("Failed to get RTSSM logs status with error code: %d", ret);
@@ -546,43 +691,91 @@ kb900x_error_t kb900x_get_hw_rtssm_logs(I2C_MSG *msg, kb900x_rtssm_all_logs_t *l
 	}
 	uint32_t length;
 	KB900X_PARSE_VALUE(msg, length);
-	// Get the number of links
-	uint8_t max_nb_links;
-	ret = kb900x_get_max_nb_links(msg, &max_nb_links);
-	if (ret != KB900X_E_OK) {
-		LOG_ERR("Error while getting the bifurcation setting of the Retimer");
+
+	// Read dump
+	uint32_t value = 0x0;
+	for (uint32_t idx = 0; idx < length / 4; idx++) {
+		ret = kb900x_read_register(msg, start_address + (4 * idx), &value);
+
+		if (ret != KB900X_E_OK) {
+			//LOG_ERR("Failed to dump the buffer with error code: %d", ret);
+			return ret;
+		}
+
+		((uint32_t *)logs)[idx] = value;
 	}
-	// Deduce nb loggers depending on length
-	const uint8_t nb_registers_per_logger = 17; // 1 for log_map_info - 16 for entries
-	const uint8_t nb_bytes_per_registers = 4;
-	logs->nb_loggers = (length / nb_bytes_per_registers) / nb_registers_per_logger;
-	if (length / nb_bytes_per_registers < logs->nb_loggers * nb_registers_per_logger) {
-		LOG_ERR("Invalid HW RTSSM length - received %d, expected %d for %d loggers",
-			length / nb_bytes_per_registers, logs->nb_loggers * nb_registers_per_logger,
-			logs->nb_loggers);
+
+	return KB900X_E_OK;
+}
+
+kb900x_error_t kb900x_get_tx_presets(I2C_MSG *msg, kb900x_all_presets_t *presets)
+{
+	CHECK_NULL_ARG_WITH_RETURN(msg, KB900X_E_INVALID_ARG);
+	CHECK_NULL_ARG_WITH_RETURN(presets, KB900X_E_INVALID_ARG);
+	KB900X_ENSURE_MINIMAL_FW_VERSION(2, 0, 5);
+
+	// Ask to prepare data
+	kb900x_error_t ret = smbus_read_command(msg, KB900X_SMBUS_OFFSET_PRESET_REQ);
+	if (ret != KB900X_E_OK) {
+		LOG_ERR("Failed to request TX presets with error code: %d", ret);
+		return ret;
+	}
+	// Check request status
+	uint8_t nb_try = KB900X_REQ_MAX_RETRY;
+	kb900x_feature_req_status_t status = KB900X_FEATURE_REQ_STATUS_IN_PROGRESS;
+	while (nb_try > 0 && status == KB900X_FEATURE_REQ_STATUS_IN_PROGRESS) {
+		k_sleep(K_MSEC(KB900X_REQ_STATUS_DELAY_MS));
+
+		ret = smbus_read_command(msg, KB900X_SMBUS_OFFSET_PRESET_REQ_STATUS);
+		if (ret != KB900X_E_OK) {
+			LOG_ERR("Failed to get TX presets status with error code: %d", ret);
+			return ret;
+		}
+		KB900X_PARSE_VALUE(msg, status);
+		nb_try--;
+	}
+	if (status != KB900X_FEATURE_REQ_STATUS_SUCCESS) {
+		LOG_ERR("Failed to get TX presets - status : %d", status);
 		return KB900X_E_FW_ERROR;
 	}
-	for (uint32_t i = 0; i < logs->nb_loggers; i++) {
-		for (uint8_t j = 0; j < nb_registers_per_logger; j++) {
-			uint32_t value;
-			ret = smbus_read_register(
-				msg,
-				start_address +
-					(i * (nb_registers_per_logger * nb_bytes_per_registers)) +
-					(j * nb_bytes_per_registers),
-				&value);
-			if (ret != KB900X_E_OK) {
-				LOG_ERR("Failed to read RTSSM logs with error code: %d", ret);
-				return ret;
-			}
-			if (j == 0) {
-				logs->logs[i].log_map_info = value;
-			} else {
-				logs->logs[i].entries[j * 2 - 2] = value & 0xFFFF;
-				logs->logs[i].entries[j * 2 - 1] = value >> 16;
-			}
-		}
+	// Get the logs
+	// Get start address
+	ret = smbus_read_command(msg, KB900X_SMBUS_OFFSET_PRESET_START_ADDR);
+	if (ret != KB900X_E_OK) {
+		LOG_ERR("Failed to get TX presets start addr with error code: %d", ret);
+		return ret;
 	}
+	uint32_t start_address;
+	KB900X_PARSE_VALUE(msg, start_address);
+	// Get length in bytes
+	ret = smbus_read_command(msg, KB900X_SMBUS_OFFSET_PRESET_LENGTH);
+	if (ret != KB900X_E_OK) {
+		LOG_ERR("Failed to get TX presets length with error code: %d", ret);
+		return ret;
+	}
+	uint32_t length;
+	KB900X_PARSE_VALUE(msg, length);
+
+	// Check if the buffer length is valid
+	if (length > sizeof(kb900x_all_presets_t)) {
+		LOG_ERR("Invalid DCCM buffer length: %u, max_size: %u", length,
+			sizeof(kb900x_all_presets_t));
+		return KB900X_E_INVALID_DATA;
+	}
+
+	// Read dump
+	uint32_t value = 0x0;
+	for (uint32_t idx = 0; idx < length / 4; idx++) {
+		ret = kb900x_read_register(msg, start_address + (4 * idx), &value);
+
+		if (ret != KB900X_E_OK) {
+			LOG_ERR("Failed to dump the buffer with error code: %d", ret);
+			return ret;
+		}
+
+		((uint32_t *)presets)[idx] = value;
+	}
+
 	return KB900X_E_OK;
 }
 
@@ -590,6 +783,7 @@ kb900x_error_t kb900x_get_firmware_health(I2C_MSG *msg, kb900x_fw_health_t *firm
 {
 	CHECK_NULL_ARG_WITH_RETURN(msg, KB900X_E_INVALID_ARG);
 	CHECK_NULL_ARG_WITH_RETURN(firmware_health, KB900X_E_INVALID_ARG);
+	KB900X_ENSURE_MINIMAL_FW_VERSION(2, 0, 3);
 
 	kb900x_error_t ret = smbus_read_command(msg, KB900X_SMBUS_OFFSET_FW_HEALTH);
 	if (ret != KB900X_E_OK) {
@@ -608,6 +802,8 @@ kb900x_error_t kb900x_get_link_status(I2C_MSG *msg, int link_id, kb900x_link_sta
 {
 	CHECK_NULL_ARG_WITH_RETURN(msg, KB900X_E_INVALID_ARG);
 	CHECK_NULL_ARG_WITH_RETURN(link_status, KB900X_E_INVALID_ARG);
+	KB900X_ENSURE_MINIMAL_FW_VERSION(2, 0, 3);
+
 	uint8_t max_nb_links;
 	kb900x_error_t ret = kb900x_get_max_nb_links(msg, &max_nb_links);
 	if (ret != KB900X_E_OK) {
@@ -631,6 +827,8 @@ kb900x_error_t kb900x_get_link_status(I2C_MSG *msg, int link_id, kb900x_link_sta
 	uint8_t nb_try = KB900X_REQ_MAX_RETRY;
 	kb900x_feature_req_status_t status = KB900X_FEATURE_REQ_STATUS_IN_PROGRESS;
 	while (nb_try > 0 && status == KB900X_FEATURE_REQ_STATUS_IN_PROGRESS) {
+		k_sleep(K_MSEC(KB900X_REQ_STATUS_DELAY_MS));
+
 		if ((ret = smbus_read_command(msg, KB900X_SMBUS_OFFSET_LINK_STATUS_READY))) {
 			LOG_ERR("Failed to get link status with error code: %d", ret);
 			return ret;
@@ -654,8 +852,7 @@ kb900x_error_t kb900x_get_link_status(I2C_MSG *msg, int link_id, kb900x_link_sta
 			   (msg->data[bytecnt - 1] << 16) + (msg->data[bytecnt] << 24);
 	// Check for data validity
 	if (link_status->raw == 0xffffffff) {
-		LOG_ERR("Invalid link status info for link %d", link_id);
-		return KB900X_E_INVALID_DATA;
+		LOG_WRN("Invalid link status info for link %d", link_id);
 	}
 	return KB900X_E_OK;
 }
@@ -664,6 +861,7 @@ kb900x_error_t kb900x_get_temperature(I2C_MSG *msg, float *temperature)
 {
 	CHECK_NULL_ARG_WITH_RETURN(msg, KB900X_E_INVALID_ARG);
 	CHECK_NULL_ARG_WITH_RETURN(temperature, KB900X_E_INVALID_ARG);
+	KB900X_ENSURE_MINIMAL_FW_VERSION(2, 0, 3);
 
 	*temperature = ABSOLUTE_ZER0;
 
@@ -691,6 +889,7 @@ kb900x_error_t kb900x_get_lane_temperature(I2C_MSG *msg, int port, int lane, flo
 {
 	CHECK_NULL_ARG_WITH_RETURN(msg, KB900X_E_INVALID_ARG);
 	CHECK_NULL_ARG_WITH_RETURN(temperature, KB900X_E_INVALID_ARG);
+	KB900X_ENSURE_MINIMAL_FW_VERSION(2, 0, 3);
 
 	if (port != KB900X_SIDE_A && port != KB900X_SIDE_B) {
 		LOG_ERR("Invalid port: %d", port);
@@ -722,8 +921,6 @@ kb900x_error_t kb900x_get_lane_temperature(I2C_MSG *msg, int port, int lane, flo
 	*temperature = ABSOLUTE_ZER0 + ((float)(raw_value_u32)) / divider;
 	return KB900X_E_OK;
 }
-
-/************** I2C MASTER SECTION START **************/
 
 K_MUTEX_DEFINE(kb900x_i2c_master_mutex);
 
@@ -1195,10 +1392,6 @@ exit:
 	return ret;
 }
 
-/************** I2C MASTER SECTION END **************/
-
-/************** EEPROM SECTION **************/
-
 kb900x_error_t kb900x_flash_firmware(I2C_MSG *msg, uint32_t addr, uint8_t *payload,
 				     size_t payload_size, const kb900x_eeprom_config_t *config)
 {
@@ -1424,57 +1617,12 @@ kb900x_error_t kb900x_check_firmware(I2C_MSG *msg, uint32_t offset, uint8_t *buf
 	return KB900X_E_NOT_IMPLEMENTED;
 }
 
-/************** EEPROM SECTION END **************/
-
-/************** CONNECTION MODE **************/
-
-/** \brief Set the communication mode used by the SDK.
- *
- * Can be either KB900X_COMM_SMBUS or KB900X_COMM_RAW_I2C.
- *
- * \param[in] msg I2C_MSG structure to communicate with KB900X,
- *                `msg->target_addr` and `msg->bus` must be set by the caller to point to KB900X
- * \param[in] mode the connection mode (KB900X_COMM_SMBUS = 0 or KB900X_COMM_RAW_I2C = 1)
- *
- * \return error code, KB900X_E_OK if successful, otherwise an other error code
- */
-kb900x_error_t kb900x_set_connection_mode(I2C_MSG *msg, kb900x_communication_mode_t mode)
-{
-	CHECK_NULL_ARG_WITH_RETURN(msg, KB900X_E_INVALID_ARG);
-	if (mode == KB900X_COMM_RAW_I2C) {
-		kb900x_register_io.write = twi_write_register;
-		kb900x_register_io.read = twi_read_register;
-	} else if (mode == KB900X_COMM_SMBUS) {
-		kb900x_register_io.write = smbus_write_register;
-		kb900x_register_io.read = smbus_read_register;
-	} else {
-		LOG_ERR("Invalid connection mode");
-		return KB900X_E_INVALID_ARG;
-	}
-	return KB900X_E_OK;
-}
-
-kb900x_error_t kb900x_get_connection_mode(kb900x_communication_mode_t *mode)
-{
-	CHECK_NULL_ARG_WITH_RETURN(mode, KB900X_E_INVALID_ARG);
-	if (kb900x_register_io.write == twi_write_register &&
-	    kb900x_register_io.read == twi_read_register) {
-		*mode = KB900X_COMM_RAW_I2C;
-	} else if (kb900x_register_io.write == smbus_write_register &&
-		   kb900x_register_io.read == smbus_read_register) {
-		*mode = KB900X_COMM_SMBUS;
-	} else {
-		LOG_ERR("Corrupted connection mode");
-		return KB900X_E_INVALID_ARG;
-	}
-	return KB900X_E_OK;
-}
-
-kb900x_error_t kb900x_detect_connection_mode(I2C_MSG *msg, kb900x_communication_mode_t *mode)
+kb900x_error_t kb900x_detect_communication_mode(I2C_MSG *msg, kb900x_communication_mode_t *mode)
 {
 	CHECK_NULL_ARG_WITH_RETURN(msg, KB900X_E_INVALID_ARG);
 	CHECK_NULL_ARG_WITH_RETURN(mode, KB900X_E_INVALID_ARG);
-	kb900x_error_t ret = kb900x_set_connection_mode(msg, KB900X_COMM_SMBUS);
+
+	kb900x_error_t ret = kb900x_set_communication_mode(msg, KB900X_COMM_SMBUS);
 	if (ret) {
 		return ret;
 	}
@@ -1484,7 +1632,7 @@ kb900x_error_t kb900x_detect_connection_mode(I2C_MSG *msg, kb900x_communication_
 		*mode = KB900X_COMM_SMBUS;
 		return KB900X_E_OK;
 	}
-	ret = kb900x_set_connection_mode(msg, KB900X_COMM_RAW_I2C);
+	ret = kb900x_set_communication_mode(msg, KB900X_COMM_RAW_I2C);
 	if (ret) {
 		return ret;
 	}
@@ -1506,20 +1654,21 @@ kb900x_error_t kb900x_detect_connection_mode(I2C_MSG *msg, kb900x_communication_
 		retry++;
 	}
 	if (retry == max_retry) {
-		LOG_ERR("Failed to detect connection mode - No ACK");
+		LOG_ERR("Failed to detect communication mode - No ACK");
 		return KB900X_E_COMM;
 	}
 	if (ret == KB900X_E_OK && (rev_id == KB900X_B0_REVID || rev_id == KB900X_B1_REVID)) {
 		*mode = KB900X_COMM_RAW_I2C;
 		return KB900X_E_OK;
 	}
-	LOG_ERR("Failed to detect connection mode - no communication");
+	LOG_ERR("Failed to detect communication mode - no communication");
 	return KB900X_E_COMM;
 }
 
 kb900x_error_t kb900x_enable_smbus(I2C_MSG *msg)
 {
 	CHECK_NULL_ARG_WITH_RETURN(msg, KB900X_E_INVALID_ARG);
+
 	bool is_ready;
 	kb900x_error_t ret = kb900x_is_firmware_ready(msg, &is_ready);
 	if (ret) {
@@ -1538,18 +1687,19 @@ kb900x_error_t kb900x_enable_smbus(I2C_MSG *msg)
 	// Wait for the firmware to enable SMBus
 	k_sleep(K_MSEC(600));
 
-	ret = kb900x_set_connection_mode(msg, KB900X_COMM_SMBUS);
+	ret = kb900x_set_communication_mode(msg, KB900X_COMM_SMBUS);
 	return ret;
 }
 
 kb900x_error_t kb900x_init_smbus(I2C_MSG *msg)
 {
 	CHECK_NULL_ARG_WITH_RETURN(msg, KB900X_E_INVALID_ARG);
+
 	// Check communication mode
 	kb900x_communication_mode_t mode;
-	kb900x_error_t ret = kb900x_detect_connection_mode(msg, &mode);
+	kb900x_error_t ret = kb900x_detect_communication_mode(msg, &mode);
 	if (ret) {
-		LOG_DBG("KB900x: Failed to detect connection mode : %d", ret);
+		LOG_DBG("KB900x: Failed to detect communication mode : %d", ret);
 		return ret;
 	}
 	if (mode == KB900X_COMM_RAW_I2C) {
@@ -1588,10 +1738,10 @@ kb900x_error_t kb900x_init_smbus(I2C_MSG *msg)
 	return KB900X_E_OK;
 }
 
-/************** CONNECTION MODE END **************/
-
 kb900x_error_t kb900x_reset(I2C_MSG *msg)
 {
+	KB900X_ENSURE_MINIMAL_FW_VERSION(2, 0, 5);
+
 	// Stub implementation, always fails
 	LOG_ERR("Not Yet Implemented");
 	return KB900X_E_NOT_IMPLEMENTED;
@@ -1617,6 +1767,8 @@ kb900x_error_t kb900x_get_boot_status(I2C_MSG *msg, kb900x_boot_entity_t *entity
 	CHECK_NULL_ARG_WITH_RETURN(msg, KB900X_E_INVALID_ARG);
 	CHECK_NULL_ARG_WITH_RETURN(entity, KB900X_E_INVALID_ARG);
 	CHECK_NULL_ARG_WITH_RETURN(status, KB900X_E_INVALID_ARG);
+	KB900X_ENSURE_MINIMAL_FW_VERSION(2, 0, 3);
+
 	uint32_t value;
 	kb900x_error_t ret = kb900x_read_register(msg, kb900x_cpu_system, &value);
 	if (ret) {
@@ -1629,20 +1781,6 @@ kb900x_error_t kb900x_get_boot_status(I2C_MSG *msg, kb900x_boot_entity_t *entity
 	*status = (value & mask_28_27) >> offset_28_27;
 	*entity = (value & mask_30_29) >> offset_30_29;
 	return KB900X_E_OK;
-}
-
-kb900x_error_t kb900x_get_revid(I2C_MSG *msg, uint32_t *revid)
-{
-	// Stub implementation, always fails
-	LOG_ERR("Not Yet Implemented");
-	return KB900X_E_NOT_IMPLEMENTED;
-}
-
-kb900x_error_t kb900x_get_sds_addr(I2C_MSG *msg, uint32_t *sds_addr)
-{
-	// Stub implementation, always fails
-	LOG_ERR("Not Yet Implemented");
-	return KB900X_E_NOT_IMPLEMENTED;
 }
 
 kb900x_error_t kb900x_dump_phy_rpcs_registers_with_offset(I2C_MSG *msg,
@@ -1720,7 +1858,14 @@ uint8_t kb900x_init(sensor_cfg *cfg)
 			LOG_ERR("KB900x: Failed to initialize kb900x : %d", ret);
 			return SENSOR_INIT_UNSPECIFIED_ERROR;
 		}
+
+		bool success = kb900x_get_fw_version(&msg, _version);
+		if (!success) {
+			LOG_ERR("KB900x: Failed to read firmware version: %d", ret);
+			return SENSOR_INIT_UNSPECIFIED_ERROR;
+		}
 	}
+
 	init_args->is_init = true;
 	cfg->read = kb900x_read;
 	return SENSOR_INIT_SUCCESS;
